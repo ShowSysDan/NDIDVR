@@ -248,8 +248,11 @@ class RecorderManager:
             ndi_name    = src.ndi_name
 
         from app.recorder.source_recorder import SourceRecorder
-        quality  = QUALITY_PROFILES.get(quality_key, QUALITY_PROFILES[DEFAULT_QUALITY])
-        rec      = SourceRecorder(ndi_name, source_id, quality, self._buffer_dir)
+        quality   = QUALITY_PROFILES.get(quality_key, QUALITY_PROFILES[DEFAULT_QUALITY])
+        gap_fill  = bool(self._app.config.get("GAP_FILL_ON_DROP", True))
+        rec       = SourceRecorder(
+            ndi_name, source_id, quality, self._buffer_dir, gap_fill=gap_fill,
+        )
         path     = self._chunk_path(source_id, ndi_name, quality_key)
         ok       = rec.start_chunk(path)
 
