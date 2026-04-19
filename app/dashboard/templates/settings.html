@@ -15,11 +15,21 @@
     <div class="card" style="padding:0;overflow:hidden">
       <table>
         <thead>
-          <tr><th>Source</th><th>Quality</th><th>Audio</th><th>Enabled</th><th></th></tr>
+          <tr>
+            <th>Preview</th><th>Source</th><th>Quality</th>
+            <th>Audio</th><th>Timelapse&nbsp;(s)</th><th>Enabled</th><th></th>
+          </tr>
         </thead>
         <tbody>
           {% for src in sources %}
           <tr>
+            <td style="width:120px">
+              <img src="/api/sources/{{ src.id }}/preview.jpg?w=112"
+                   alt="" width="112" height="63"
+                   style="background:var(--bg);border:1px solid var(--border);border-radius:4px;object-fit:cover;display:block"
+                   data-preview-id="{{ src.id }}"
+                   onerror="this.style.opacity=0.2">
+            </td>
             <td>
               <div style="font-weight:500">{{ src.label }}</div>
               <div class="text-muted text-sm mono">{{ src.ndi_name }}</div>
@@ -41,6 +51,13 @@
               </label>
             </td>
             <td>
+              <input type="number" min="0" max="86400" step="1"
+                     value="{{ src.timelapse_interval_seconds or 0 }}"
+                     title="Still JPEG interval in seconds. 0 disables."
+                     style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 8px;font-size:12px;width:74px"
+                     onblur="setTimelapse({{ src.id }}, this.value)">
+            </td>
+            <td>
               <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
                 <input type="checkbox" {% if src.enabled %}checked{% endif %}
                        onchange="setEnabled({{ src.id }}, this.checked)">
@@ -54,7 +71,7 @@
             </td>
           </tr>
           {% else %}
-          <tr><td colspan="5" style="text-align:center;padding:32px;color:var(--muted)">
+          <tr><td colspan="7" style="text-align:center;padding:32px;color:var(--muted)">
             No sources yet. <a href="#" onclick="scan()" style="color:var(--accent)">Scan the network.</a>
           </td></tr>
           {% endfor %}
@@ -117,8 +134,8 @@
 {% block scripts %}
 <script>
 async function setQuality(id, q) {
-  await fetch(`/api/sources/${id}/quality`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
+  await fetch(`/api/sources/${id}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({quality: q}),
   });
 }
@@ -140,6 +157,17 @@ async function setName(id, name) {
     body: JSON.stringify({display_name: name}),
   });
 }
+async function setTimelapse(id, val) {
+  await fetch(`/api/sources/${id}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({timelapse_interval_seconds: parseInt(val, 10) || 0}),
+  });
+}
+setInterval(() => {
+  document.querySelectorAll('img[data-preview-id]').forEach(img => {
+    img.src = `/api/sources/${img.dataset.previewId}/preview.jpg?w=112&_=` + Date.now();
+  });
+}, 3000);
 async function scan() {
   const resp = await fetch('/api/sources/scan', {method:'POST'});
   const data = await resp.json();

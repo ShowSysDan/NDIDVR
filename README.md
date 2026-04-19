@@ -1,6 +1,8 @@
 # NDI Recorder
 
-A Python/Flask web application for continuous multi-source NDI recording with S3-compatible storage, PostgreSQL metadata, scheduled 30-minute chunking, tiered quality profiles, and a real-time system health dashboard.
+> Version 0.4.0
+
+A Python/Flask web application for continuous multi-source NDI recording with S3-compatible storage, PostgreSQL metadata, scheduled 30-minute chunking, tiered quality profiles, per-source live previews, optional timelapse stills, and a real-time system health dashboard.
 
 ---
 
@@ -90,8 +92,14 @@ All source metadata, recording sessions, chunk manifests, and settings live in P
 - **Unlimited NDI sources** — auto-discovers all NDI sources on the network; new sources are picked up without restart
 - **30-minute chunk recording** — chunks rotate exactly on the hour and half-hour for predictable file naming and easy retrieval
 - **Two quality tiers** — archive quality (24/7 default) and full quality (on-demand per source)
+- **Live JPEG previews** — every active source exposes `/api/sources/<id>/preview.jpg`; the Settings page auto-refreshes thumbnails every 3 s at zero extra capture cost
+- **Timelapse stills** — set a per-source interval in the Settings page and the recorder writes timestamped JPEGs to `TIMELAPSE_DIR/<source>/` (filename format `name_YYYYMMDD_HHMMSSZ.jpg`)
+- **Per-source audio toggle** — disable encoding for silent feeds to save CPU + disk
+- **Retention UI** — edit raw-days, compressed-days, and nightly hour from the Settings page; kick off an ad-hoc retention pass with one click
 - **S3-first storage** — local disk is buffer only; chunks upload to S3 on completion and are removed locally after confirmation
-- **7-day retention with compression** — raw chunks older than 7 days are re-encoded to H.265 at a high-compression profile and the originals are deleted
+- **Auto-migrate on startup** — `alembic upgrade head` runs at boot so a `git pull && systemctl restart` picks up schema changes with zero manual steps
+- **Gap-fill on drop** — keeps writing duplicated frames + silent audio while an NDI source is temporarily unavailable, preserving chunk timing
+- **Retention with compression** — raw chunks older than `RETENTION_RAW_DAYS` are re-encoded to H.265 at a high-compression profile and the originals are deleted
 - **Real-time CPU / memory graph** — live chart in the dashboard powered by `psutil`; see per-core and total load at a glance
 - **PostgreSQL metadata** — all source configs, recording sessions, chunk manifests, quality settings, and S3 paths tracked in relational tables
 - **Per-source quality override** — toggle any source between archive and full quality mid-stream; the next chunk picks up the new profile
@@ -99,6 +107,7 @@ All source metadata, recording sessions, chunk manifests, and settings live in P
 - **FFmpeg pipeline** — raw NDI frames piped to FFmpeg; no intermediate file writes during capture
 - **Graceful shutdown** — SIGTERM closes open FFmpeg processes, finalizes current chunks, and triggers upload before exit
 - **Optional syslog output** — ship structured logs to a central syslog server (UDP/TCP) or a local Unix socket like `/dev/log`
+- **App version in UI + API** — current build is displayed in the nav bar and returned by `/api/system/health`
 
 ---
 
@@ -177,12 +186,6 @@ pip install --upgrade pip
 pip install -r ~/ndi-recorder/requirements.txt
 ```
 
-Or use the Makefile shortcut:
-
-```bash
-cd ~/ndi-recorder && make install
-```
-
 ### 4. Configure environment
 
 ```bash
@@ -228,8 +231,8 @@ sudo chown ndi:ndi /var/ndi-recorder/buffer
 sudo -iu ndi
 cd ~/ndi-recorder
 source venv/bin/activate
-flask --app wsgi:app scan     # should list NDI sources on the network
-python wsgi.py                # starts the dev server on :5000
+flask --app wsgi:app scan                    # should list NDI sources on the network
+gunicorn -c gunicorn.conf.py wsgi:app        # start the app on :5000
 ```
 
 Open `http://<host>:5000/` — if the dashboard loads, you're ready to install as a service.
@@ -265,6 +268,10 @@ LOCAL_BUFFER_MAX_GB=50
 CHUNK_DURATION_MINUTES=30
 NDI_DISCOVERY_TIMEOUT_MS=5000
 NDI_RESCAN_INTERVAL_SECONDS=30
+TIMELAPSE_DIR=/var/ndi-recorder/timelapse         # where per-source JPEG stills are written
+START_IMMEDIATELY_ON_BOOT=true
+GAP_FILL_ON_DROP=true
+AUTO_MIGRATE_ON_STARTUP=true
 
 # ── Retention ─────────────────────────────────────────────────────────────────
 RETENTION_RAW_DAYS=7
@@ -418,7 +425,7 @@ Two capture profiles plus one automatic long-term profile. All sources at 1080p6
 | CRF | `28` |
 | Approx. size vs archive | ~40–50% |
 
-Profiles live in `config/quality.py`.
+Profiles live in `app/quality_profiles.py`.
 
 ---
 
@@ -453,32 +460,14 @@ Day 365+:  Compressed chunks expire per RETENTION_COMPRESSED_DAYS
 
 ## Running the Application
 
-### Development (from inside the venv)
-
-```bash
-cd ~/ndi-recorder
-source venv/bin/activate
-python wsgi.py            # listens on HOST:PORT from .env
-```
-
-### Production (gunicorn + eventlet)
-
 ```bash
 cd ~/ndi-recorder
 source venv/bin/activate
 gunicorn -c gunicorn.conf.py wsgi:app
 ```
 
-> Use `eventlet` or `gevent` — Flask-SocketIO requires an async worker for the live stats WebSocket.
-
-### Running the test suite
-
-Tests run against the same PostgreSQL database as the application; isolation is via savepoint rollback, so no test data ever commits. NDIlib and boto3 are mocked globally.
-
-```bash
-cd ~/ndi-recorder && source venv/bin/activate
-make test
-```
+> Flask-SocketIO requires an async worker for the live stats WebSocket — the bundled `gunicorn.conf.py` pins `eventlet`.
+> `wsgi.py` is the single production entry point; there is no separate development server.
 
 ---
 
@@ -518,7 +507,7 @@ The Flask web dashboard runs at `http://<host>:5000`.
 | `/` | Overview — discovered sources, live status, CPU/memory, current chunks |
 | `/browse` | Chunk browser with date/source filters |
 | `/storage` | S3 usage totals per source and per day |
-| `/settings` | Source management (rename, enable/disable, quality profile) |
+| `/settings` | Source management (rename, enable/disable, quality profile, audio on/off, timelapse interval) + live previews + retention policy editor |
 
 The UI is themed to match the [WebRetriever2](https://github.com/ShowSysDan/WebRetriever2) dark broadcasting palette: near-black surfaces, neon green active state, Outfit + JetBrains Mono typography.
 
@@ -534,7 +523,8 @@ All endpoints return JSON.
 |---|---|---|
 | `GET` | `/api/sources` | List all known NDI sources |
 | `GET` | `/api/sources/{id}` | Get source details |
-| `PATCH` | `/api/sources/{id}` | Update source settings (name, enabled, quality) |
+| `PATCH` | `/api/sources/{id}` | Update source settings (`display_name`, `enabled`, `quality`, `record_audio`, `timelapse_interval_seconds`) |
+| `GET` | `/api/sources/{id}/preview.jpg` | Latest frame as JPEG (query params: `w` max width in px, `q` quality 30-95). Returns 404 when the source isn't actively recording. |
 | `POST` | `/api/sources/scan` | Trigger an immediate NDI rescan |
 
 ### Recordings
@@ -549,7 +539,10 @@ All endpoints return JSON.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/system/health` | CPU, memory, buffer usage, active recorder count |
+| `GET` | `/api/system/health` | CPU, memory, buffer usage, active recorder count, app version |
+| `GET` | `/api/system/retention` | Current retention policy (`retention_raw_days`, `retention_compressed_days`, `compression_hour`) |
+| `PUT` | `/api/system/retention` | Update retention policy — takes effect on the next nightly run |
+| `POST` | `/api/system/retention` | Trigger the retention/compression pass immediately in the background |
 | `GET` | `/api/storage/summary` | S3 usage totals by source and date |
 
 ### Example
@@ -565,24 +558,22 @@ curl http://localhost:5000/api/sources | python3 -m json.tool
 ```
 ~/ndi-recorder/
 ├── app/
-│   ├── __init__.py              # Flask app factory
+│   ├── __init__.py              # Flask app factory + version + CLI `scan`
 │   ├── extensions.py            # SQLAlchemy, SocketIO, APScheduler
 │   ├── logging_config.py        # Console + rotating file + optional syslog
-│   ├── api/__init__.py          # Sources, Recordings, System blueprints
-│   ├── models/                  # SQLAlchemy models (source, chunk)
+│   ├── quality_profiles.py      # Archive / full / compressed encoding profiles
+│   ├── api/                     # Sources, Recordings, System blueprints
+│   ├── models/                  # SQLAlchemy models (source, chunk, app_settings)
 │   ├── recorder/                # NDI capture, upload, scheduler, retention
 │   └── dashboard/               # Flask views + Jinja templates
-├── config/
-│   ├── defaults.py              # App-level defaults
-│   └── quality.py               # Quality profile definitions
 ├── migrations/                  # Alembic migration files
 ├── deploy/
 │   └── ndi-recorder.service     # systemd unit (venv-based)
-├── tests/                       # pytest suite (savepoint-isolated)
 ├── .env.example
+├── alembic.ini
 ├── requirements.txt
 ├── gunicorn.conf.py
-├── wsgi.py                      # WSGI entry point
+├── wsgi.py                      # Gunicorn WSGI entry point
 └── README.md
 ```
 
@@ -635,4 +626,4 @@ MIT License.
 
 ## Contributing
 
-Pull requests welcome. Please open an issue first for significant changes. Run `make test` before submitting.
+Pull requests welcome. Please open an issue first for significant changes.

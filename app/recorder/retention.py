@@ -25,7 +25,7 @@ def run_retention(app):
     from app.models.chunk import Chunk
     from app.models.setting import get_int
     from app.recorder.uploader import uploader
-    from config.quality import QUALITY_PROFILES
+    from app.quality_profiles import QUALITY_PROFILES
 
     # Settings table overrides env/config so retention policy can be tuned
     # from the dashboard without a restart.

@@ -18,7 +18,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from config.quality import DEFAULT_QUALITY, QUALITY_PROFILES
+from app.quality_profiles import DEFAULT_QUALITY, QUALITY_PROFILES
 
 log = logging.getLogger(__name__)
 
@@ -252,13 +252,17 @@ class RecorderManager:
             quality_key  = src.quality
             ndi_name     = src.ndi_name
             record_audio = bool(src.record_audio)
+            tl_interval  = int(src.timelapse_interval_seconds or 0)
 
         from app.recorder.source_recorder import SourceRecorder
-        quality   = QUALITY_PROFILES.get(quality_key, QUALITY_PROFILES[DEFAULT_QUALITY])
-        gap_fill  = bool(self._app.config.get("GAP_FILL_ON_DROP", True))
-        rec       = SourceRecorder(
+        quality       = QUALITY_PROFILES.get(quality_key, QUALITY_PROFILES[DEFAULT_QUALITY])
+        gap_fill      = bool(self._app.config.get("GAP_FILL_ON_DROP", True))
+        timelapse_dir = self._app.config.get("TIMELAPSE_DIR")
+        rec           = SourceRecorder(
             ndi_name, source_id, quality, self._buffer_dir,
             gap_fill=gap_fill, record_audio=record_audio,
+            timelapse_interval_seconds=tl_interval,
+            timelapse_dir=timelapse_dir,
         )
         path     = self._chunk_path(source_id, ndi_name, quality_key)
         ok       = rec.start_chunk(path)
@@ -367,15 +371,6 @@ class RecorderManager:
             )
             db.session.commit()
             uploader.enqueue(chunk.id, local_path, s3_key)
-
-    def _db_quality(self, source_id: int) -> str:
-        try:
-            with self._app.app_context():
-                from app.models.source import Source
-                s = Source.query.get(source_id)
-                return s.quality if s else DEFAULT_QUALITY
-        except Exception:
-            return DEFAULT_QUALITY
 
 
 # Module-level singleton

@@ -56,6 +56,8 @@ class SourceRecorder:
         buffer_dir: str,
         gap_fill: bool = True,
         record_audio: bool = True,
+        timelapse_interval_seconds: int = 0,
+        timelapse_dir: str | None = None,
     ):
         self.ndi_source_name = ndi_source_name
         self.source_id = source_id
@@ -63,6 +65,9 @@ class SourceRecorder:
         self.buffer_dir = buffer_dir
         self.gap_fill = gap_fill
         self.record_audio = record_audio
+        # 0 (or anything <= 0) means timelapse disabled for this source.
+        self.timelapse_interval_seconds = max(0, int(timelapse_interval_seconds or 0))
+        self.timelapse_dir = timelapse_dir
 
         # Runtime state
         self._recv = None
@@ -87,6 +92,12 @@ class SourceRecorder:
         self._last_audio_write: float = 0.0
         self._silence_chunk_bytes: bytes = b""
         self._frame_period: float = 1.0 / 60.0
+
+        # Preview / timelapse: the last decoded frame is already cached for
+        # gap-fill. Reuse it — no extra copy in the hot path.
+        self._preview_lock = threading.Lock()
+        self._timelapse_thread: threading.Thread | None = None
+        self._last_timelapse_write: float = 0.0
 
         self.current_chunk_path: str | None = None
         self.current_chunk_start: datetime | None = None
@@ -316,6 +327,16 @@ class SourceRecorder:
             )
             self._keepalive_thread.start()
 
+        # ── Launch timelapse writer (optional) ────────────────────────────────
+        if self.timelapse_interval_seconds > 0 and self.timelapse_dir:
+            self._last_timelapse_write = time.monotonic()
+            self._timelapse_thread = threading.Thread(
+                target=self._timelapse_loop,
+                daemon=True,
+                name=f"timelapse-{self.source_id}",
+            )
+            self._timelapse_thread.start()
+
         self.status = "recording"
         return True
 
@@ -334,6 +355,8 @@ class SourceRecorder:
             self._receive_thread.join(timeout=5)
         if self._keepalive_thread and self._keepalive_thread.is_alive():
             self._keepalive_thread.join(timeout=2)
+        if self._timelapse_thread and self._timelapse_thread.is_alive():
+            self._timelapse_thread.join(timeout=2)
 
         # Close FIFOs → FFmpeg gets EOF on both inputs (take the write locks
         # so we don't race with an in-flight gap-fill write)
@@ -563,6 +586,76 @@ class SourceRecorder:
                             self.audio_silence_bytes += len(payload)
                         if broken:
                             return
+
+    # ── Preview / timelapse ──────────────────────────────────────────────────
+
+    def get_preview_jpeg(self, max_width: int = 640, quality: int = 70) -> bytes | None:
+        """Encode the most recent decoded frame as a JPEG.
+
+        Returns None when the recorder hasn't produced a frame yet — callers
+        should respond with a 404/204 in that case. Resizes to max_width for
+        dashboard thumbnails so we're not shipping full 4K frames on refresh.
+        """
+        with self._preview_lock:
+            raw    = self._last_video_bytes
+            width  = self._width
+            height = self._height
+        if not raw or not width or not height:
+            return None
+        try:
+            from PIL import Image
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 4)
+            # NDI RECV_COLOR_FORMAT_BGRX_BGRA: B, G, R, A/X — reorder to RGB
+            rgb = arr[:, :, [2, 1, 0]]
+            img = Image.fromarray(rgb, mode="RGB")
+            if max_width and width > max_width:
+                new_h = int(height * max_width / width)
+                img = img.resize((max_width, new_h), Image.BILINEAR)
+            import io
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=int(quality), optimize=True)
+            return buf.getvalue()
+        except Exception as exc:
+            log.warning("Preview encode failed for source %d: %s", self.source_id, exc)
+            return None
+
+    def _timelapse_loop(self):
+        """Saves a full-resolution JPEG every N seconds to `timelapse_dir`.
+
+        Filename: <safe_ndi_name>_YYYYMMDD_HHMMSSZ.jpg so chronological sort
+        works out of the box. Skips ticks when there's no frame yet (source
+        is still connecting) rather than writing a blank still.
+        """
+        import re
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", self.ndi_source_name).strip("_-.") or f"source_{self.source_id}"
+        target_dir = os.path.join(self.timelapse_dir or "", safe)
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as exc:
+            log.error("Timelapse dir %s unwritable: %s — disabling", target_dir, exc)
+            return
+
+        interval = float(self.timelapse_interval_seconds)
+        while not self._stop_event.is_set():
+            # Sleep in short slices so stop() is responsive, but only save once
+            # per full interval.
+            if self._stop_event.wait(min(interval, 1.0)):
+                return
+            if time.monotonic() - self._last_timelapse_write < interval:
+                continue
+
+            jpeg = self.get_preview_jpeg(max_width=self._width, quality=88)
+            if jpeg is None:
+                continue
+
+            ts = datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
+            path = os.path.join(target_dir, f"{safe}_{ts}.jpg")
+            try:
+                with open(path, "wb") as f:
+                    f.write(jpeg)
+                self._last_timelapse_write = time.monotonic()
+            except OSError as exc:
+                log.warning("Timelapse write failed %s: %s", path, exc)
 
     def _teardown(self, ndi):
         """Clean up FIFOs and NDI receiver."""

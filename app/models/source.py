@@ -13,6 +13,9 @@ class Source(db.Model):
     # Most NDI feeds in this deployment are video-only; capturing audio
     # costs encoder cycles + file size, so it's per-source opt-in.
     record_audio = db.Column(db.Boolean, default=True, nullable=False)
+    # Timelapse: save a full-res JPEG every N seconds to TIMELAPSE_DIR.
+    # 0 disables (the default) so there's no extra I/O unless opted in.
+    timelapse_interval_seconds = db.Column(db.Integer, default=0, nullable=False)
     first_seen = db.Column(db.DateTime, default=datetime.utcnow)
     last_seen = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -31,6 +34,7 @@ class Source(db.Model):
             "enabled": self.enabled,
             "quality": self.quality,
             "record_audio": self.record_audio,
+            "timelapse_interval_seconds": self.timelapse_interval_seconds or 0,
             "first_seen": self.first_seen.isoformat() if self.first_seen else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
         }
