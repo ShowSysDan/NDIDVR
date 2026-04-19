@@ -55,12 +55,14 @@ class SourceRecorder:
         quality: dict,
         buffer_dir: str,
         gap_fill: bool = True,
+        record_audio: bool = True,
     ):
         self.ndi_source_name = ndi_source_name
         self.source_id = source_id
         self.quality = quality
         self.buffer_dir = buffer_dir
         self.gap_fill = gap_fill
+        self.record_audio = record_audio
 
         # Runtime state
         self._recv = None
@@ -151,10 +153,11 @@ class SourceRecorder:
         ndi.recv_connect(self._recv, src)
 
         # ── Learn stream properties from first frames ─────────────────────────
+        # We always need video; audio probing is skipped when record_audio=False.
         deadline = time.monotonic() + 10
         got_video = False
         got_audio = False
-        while time.monotonic() < deadline and not (got_video and got_audio):
+        while time.monotonic() < deadline and not (got_video and (got_audio or not self.record_audio)):
             t, v, a, _ = ndi.recv_capture_v2(self._recv, 500)
             if t == ndi.FRAME_TYPE_VIDEO:
                 self._width  = v.xres
@@ -176,12 +179,15 @@ class SourceRecorder:
             self._recv = None
             return False
 
-        # ── Create named FIFOs ────────────────────────────────────────────────
+        # ── Create named FIFOs (audio only when recording audio) ─────────────
         self._fifo_dir  = tempfile.mkdtemp(prefix="ndi_rec_")
         self._video_fifo = os.path.join(self._fifo_dir, "video.raw")
-        self._audio_fifo = os.path.join(self._fifo_dir, "audio.raw")
         os.mkfifo(self._video_fifo)
-        os.mkfifo(self._audio_fifo)
+        if self.record_audio:
+            self._audio_fifo = os.path.join(self._fifo_dir, "audio.raw")
+            os.mkfifo(self._audio_fifo)
+        else:
+            self._audio_fifo = None
 
         # ── Build FFmpeg command ──────────────────────────────────────────────
         q = self.quality
@@ -193,32 +199,48 @@ class SourceRecorder:
             "-r", f"{self._fps_n}/{self._fps_d}",
             "-thread_queue_size", "512",
             "-i", self._video_fifo,
-            "-f", "f32le",
-            "-ar", str(self._sample_rate),
-            "-ac", str(self._channels),
-            "-thread_queue_size", "512",
-            "-i", self._audio_fifo,
+        ]
+        if self.record_audio:
+            cmd += [
+                "-f", "f32le",
+                "-ar", str(self._sample_rate),
+                "-ac", str(self._channels),
+                "-thread_queue_size", "512",
+                "-i", self._audio_fifo,
+            ]
+        cmd += [
             "-c:v", q["vcodec"],
             "-preset", q["preset"],
             "-crf", str(q["crf"]),
             "-pix_fmt", q["pix_fmt"],
-            "-c:a", q["acodec"],
-            "-b:a", q["audio_bitrate"],
+        ]
+        if self.record_audio:
+            cmd += [
+                "-c:a", q["acodec"],
+                "-b:a", q["audio_bitrate"],
+            ]
+        else:
+            cmd += ["-an"]
+        cmd += [
             "-movflags", "+faststart",
             chunk_path,
         ]
 
+        # Quiet FFmpeg output so the stderr pipe can't fill and stall encoding
+        cmd = [cmd[0], "-hide_banner", "-loglevel", "error", "-nostats"] + cmd[1:]
+
         log.info(
-            "FFmpeg start: source=%d  %dx%d@%d/%d  quality=%s  path=%s",
+            "FFmpeg start: source=%d  %dx%d@%d/%d  quality=%s  audio=%s  path=%s",
             self.source_id, self._width, self._height,
             self._fps_n, self._fps_d,
             q.get("label", "?"),
+            "on" if self.record_audio else "off",
             os.path.basename(chunk_path),
         )
 
         self._ffmpeg = subprocess.Popen(
             cmd,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
         )
 
@@ -230,21 +252,24 @@ class SourceRecorder:
         def _open_video():
             try:
                 self._video_fp = open(self._video_fifo, "wb", buffering=0)
-                video_ready.set()
             except Exception as exc:
                 log.error("Video FIFO open failed: %s", exc)
+            finally:
                 video_ready.set()
 
         def _open_audio():
             try:
                 self._audio_fp = open(self._audio_fifo, "wb", buffering=0)
-                audio_ready.set()
             except Exception as exc:
                 log.error("Audio FIFO open failed: %s", exc)
+            finally:
                 audio_ready.set()
 
         threading.Thread(target=_open_video, daemon=True).start()
-        threading.Thread(target=_open_audio, daemon=True).start()
+        if self.record_audio:
+            threading.Thread(target=_open_audio, daemon=True).start()
+        else:
+            audio_ready.set()
 
         if not video_ready.wait(10) or not audio_ready.wait(10):
             log.error("FIFO open timeout for source %d", self.source_id)
@@ -254,7 +279,16 @@ class SourceRecorder:
             return False
 
         # ── Prime gap-fill state ──────────────────────────────────────────────
-        self._frame_period = self._fps_d / max(self._fps_n, 1)
+        # Clamp to plausible frame rates. A malformed NDI source advertising
+        # e.g. 1/60000 would otherwise give a 60000-second frame period and
+        # silently disable gap-fill.
+        fps_n = max(self._fps_n, 1)
+        fps_d = max(self._fps_d, 1)
+        raw_period = fps_d / fps_n
+        if 0 < raw_period <= 1.0:
+            self._frame_period = raw_period
+        else:
+            self._frame_period = 1.0 / 30.0  # sensible default
         now = time.monotonic()
         self._last_video_write = now
         self._last_audio_write = now
@@ -324,20 +358,16 @@ class SourceRecorder:
                 self._ffmpeg.wait(timeout=30)
                 rc = self._ffmpeg.returncode
                 if rc != 0:
-                    stderr = b""
-                    if self._ffmpeg.stderr:
-                        try:
-                            stderr = self._ffmpeg.stderr.read(2000)
-                        except Exception:
-                            pass
-                    log.warning(
-                        "FFmpeg exited %d for source %d: %s",
-                        rc, self.source_id,
-                        stderr.decode(errors="replace")[-300:],
-                    )
+                    log.warning("FFmpeg exited %d for source %d", rc, self.source_id)
             except subprocess.TimeoutExpired:
                 log.warning("FFmpeg did not exit in 30s — killing")
                 self._ffmpeg.kill()
+                try:
+                    # Reap the killed child so we don't leak zombies over weeks
+                    self._ffmpeg.wait(timeout=5)
+                except Exception:
+                    pass
+            self._ffmpeg = None
 
         self._teardown(None)
         self.status = "idle"
@@ -358,13 +388,20 @@ class SourceRecorder:
 
     def _find_source(self, ndi):
         find = ndi.find_create_v2()
-        ndi.find_wait_for_sources(find, 4000)
-        sources = ndi.find_get_current_sources(find)
-        ndi.find_destroy(find)
-        for src in sources:
-            if src.ndi_name == self.ndi_source_name:
-                return src
-        return None
+        try:
+            ndi.find_wait_for_sources(find, 4000)
+            sources = ndi.find_get_current_sources(find)
+            for src in sources:
+                if src.ndi_name == self.ndi_source_name:
+                    return src
+            return None
+        finally:
+            # Always release the finder, even if discovery raised — otherwise
+            # we leak a finder handle on every rotation.
+            try:
+                ndi.find_destroy(find)
+            except Exception:
+                pass
 
     def _receive_loop(self, ndi):
         """
@@ -386,17 +423,24 @@ class SourceRecorder:
                 consecutive_timeouts = 0
                 self._last_frame_time = time.monotonic()
                 self.frames_video += 1
-                frame_bytes = bytes(v.data)
-                # Cache for the keep-alive thread to duplicate during drops
-                self._last_video_bytes = frame_bytes
-                if not self._write_video(frame_bytes):
+                try:
+                    frame_bytes = bytes(v.data)
+                    # Cache for the keep-alive thread to duplicate during drops
+                    self._last_video_bytes = frame_bytes
+                    if not self._write_video(frame_bytes):
+                        break
+                finally:
+                    # Always free the NDI video buffer, even if the read/copy
+                    # or the FIFO write raises — otherwise the NDI SDK leaks.
                     ndi.recv_free_video_v2(self._recv, v)
-                    break
-                ndi.recv_free_video_v2(self._recv, v)
 
             elif t == ndi.FRAME_TYPE_AUDIO:
                 consecutive_timeouts = 0
                 self._last_frame_time = time.monotonic()
+                if not self.record_audio:
+                    # Still need to free the frame even if we're dropping it
+                    ndi.recv_free_audio_v2(self._recv, a)
+                    continue
                 self.frames_audio += 1
                 try:
                     # NDI audio: float32 planar (channels × samples)
@@ -494,21 +538,31 @@ class SourceRecorder:
                 missing = int(elapsed / period)
                 if missing > 0:
                     payload = self._last_video_bytes
+                    broken = False
                     for _ in range(missing):
                         if not self._write_video(payload):
+                            # FFmpeg died or FIFO closed — give up, no point busy-spinning
+                            broken = True
                             break
                         self.frames_filled += 1
+                    if broken:
+                        return
 
             # ── Audio gap fill ────────────────────────────────────────────────
-            audio_elapsed = now - self._last_audio_write
-            if audio_elapsed > _AUDIO_GAP_THRESHOLD and self._silence_chunk_bytes:
-                chunks = int(audio_elapsed / 0.02)  # 20 ms silence blocks
-                if chunks > 0:
-                    payload = self._silence_chunk_bytes
-                    for _ in range(chunks):
-                        if not self._write_audio(payload):
-                            break
-                        self.audio_silence_bytes += len(payload)
+            if self.record_audio:
+                audio_elapsed = now - self._last_audio_write
+                if audio_elapsed > _AUDIO_GAP_THRESHOLD and self._silence_chunk_bytes:
+                    chunks = int(audio_elapsed / 0.02)  # 20 ms silence blocks
+                    if chunks > 0:
+                        payload = self._silence_chunk_bytes
+                        broken = False
+                        for _ in range(chunks):
+                            if not self._write_audio(payload):
+                                broken = True
+                                break
+                            self.audio_silence_bytes += len(payload)
+                        if broken:
+                            return
 
     def _teardown(self, ndi):
         """Clean up FIFOs and NDI receiver."""
@@ -520,3 +574,5 @@ class SourceRecorder:
         self._fifo_dir   = None
         self._video_fifo = None
         self._audio_fifo = None
+        # Drop the cached raw BGRA frame — at 4K60 this is ~33 MB pinned otherwise
+        self._last_video_bytes = None

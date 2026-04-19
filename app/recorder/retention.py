@@ -23,11 +23,14 @@ log = logging.getLogger(__name__)
 def run_retention(app):
     from app.extensions import db
     from app.models.chunk import Chunk
+    from app.models.setting import get_int
     from app.recorder.uploader import uploader
     from config.quality import QUALITY_PROFILES
 
-    raw_days = app.config.get("RETENTION_RAW_DAYS", 7)
-    compressed_days = app.config.get("RETENTION_COMPRESSED_DAYS", 365)
+    # Settings table overrides env/config so retention policy can be tuned
+    # from the dashboard without a restart.
+    raw_days        = get_int("retention_raw_days",        app.config.get("RETENTION_RAW_DAYS", 7))
+    compressed_days = get_int("retention_compressed_days", app.config.get("RETENTION_COMPRESSED_DAYS", 365))
     cutoff_raw = datetime.now(timezone.utc) - timedelta(days=raw_days)
     compressed_profile = QUALITY_PROFILES["compressed"]
 

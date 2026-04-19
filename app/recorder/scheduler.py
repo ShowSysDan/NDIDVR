@@ -37,10 +37,13 @@ def register_jobs(scheduler, app):
     )
 
     # ── System snapshot (SocketIO push) ───────────────────────────────────────
+    # max_instances=1 is APScheduler's default, but be explicit; on a loaded
+    # system a slow snapshot shouldn't stack up pending executions.
     scheduler.add_job(
         func=_snapshot, trigger="interval", seconds=2,
         id="system_snapshot", name="System snapshot",
-        replace_existing=True, kwargs={"app": app},
+        replace_existing=True, max_instances=1,
+        misfire_grace_time=5, kwargs={"app": app},
     )
 
     # ── Upload retry ──────────────────────────────────────────────────────────
@@ -58,11 +61,26 @@ def register_jobs(scheduler, app):
     )
 
     # ── Nightly retention / compression ──────────────────────────────────────
-    compression_hour = app.config.get("COMPRESSION_SCHEDULE_HOUR", 2)
+    # Prefer the DB-stored setting so changes in the UI survive restarts without
+    # a manual env-var edit. Falls back to config value on first boot.
+    from app.models.setting import get_int
+    with app.app_context():
+        compression_hour = get_int(
+            "compression_hour",
+            app.config.get("COMPRESSION_SCHEDULE_HOUR", 2),
+        )
     scheduler.add_job(
         func=_retention, trigger="cron", hour=compression_hour, minute=0,
         id="retention", name="Retention & compression",
         replace_existing=True, kwargs={"app": app},
+    )
+
+    # Sync the cron trigger with the DB setting every hour so UI changes to
+    # compression_hour become effective without a service restart.
+    scheduler.add_job(
+        func=_sync_retention_hour, trigger="interval", minutes=60,
+        id="retention_hour_sync", name="Retention hour sync",
+        replace_existing=True, kwargs={"app": app, "scheduler": scheduler},
     )
 
     log.info(
@@ -175,3 +193,36 @@ def _retention(app):
     from app.recorder.retention import run_retention
     with app.app_context():
         run_retention(app)
+
+
+# Tracks the hour currently baked into the cron trigger so we only reschedule
+# on actual change.
+_current_retention_hour: int | None = None
+
+
+def _sync_retention_hour(app, scheduler):
+    """Re-read the retention hour from DB settings and reschedule if changed."""
+    global _current_retention_hour
+    from app.models.setting import get_int
+    from apscheduler.triggers.cron import CronTrigger
+
+    try:
+        with app.app_context():
+            new_hour = get_int(
+                "compression_hour",
+                app.config.get("COMPRESSION_SCHEDULE_HOUR", 2),
+            )
+    except Exception:
+        log.exception("Could not read compression_hour setting")
+        return
+
+    if _current_retention_hour is None or new_hour != _current_retention_hour:
+        log.info("Rescheduling retention job to %02d:00 UTC", new_hour)
+        try:
+            scheduler.reschedule_job(
+                "retention",
+                trigger=CronTrigger(hour=new_hour, minute=0),
+            )
+            _current_retention_hour = new_hour
+        except Exception:
+            log.exception("Reschedule of retention job failed")

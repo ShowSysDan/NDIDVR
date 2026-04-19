@@ -64,6 +64,9 @@ def update_source(source_id):
             return jsonify({"error": "Invalid quality profile"}), 400
         src.quality = data["quality"]
         manager.set_quality(source_id, data["quality"])
+    if "record_audio" in data:
+        # Takes effect on next rotation (the recorder picks it up in _rotate)
+        src.record_audio = bool(data["record_audio"])
 
     db.session.commit()
     return jsonify(src.to_dict())
@@ -129,6 +132,8 @@ def list_chunks():
 
     page = request.args.get("page", 1, type=int)
     per_page = request.args.get("per_page", 50, type=int)
+    # Cap so a client can't request a million-row LIMIT and OOM the worker
+    per_page = max(1, min(per_page, 500))
     pagination = q.order_by(Chunk.started_at.desc()).paginate(page=page, per_page=per_page, error_out=False)
 
     return jsonify({
@@ -189,10 +194,20 @@ def download_chunk(chunk_id):
 
 
 def _serve_local(chunk):
-    """Serve from local buffer (chunk still uploading)."""
-    from flask import send_file
+    """Serve from local buffer (chunk still uploading).
+
+    Validate that the path lives inside the configured buffer dir before
+    handing it to send_file — protects against a DB-level tampering edge
+    case where local_path might point anywhere on disk.
+    """
+    from flask import abort, current_app, send_file
+    buffer_dir = os.path.realpath(current_app.config.get("LOCAL_BUFFER_DIR", "/tmp/ndi_buffer"))
+    target = os.path.realpath(chunk.local_path or "")
+    if not target.startswith(buffer_dir + os.sep):
+        log.error("Refusing to serve chunk %d: local_path %s outside buffer dir", chunk.id, chunk.local_path)
+        abort(404)
     return send_file(
-        chunk.local_path,
+        target,
         as_attachment=True,
         download_name=chunk.filename,
         mimetype="video/mp4",
@@ -260,6 +275,69 @@ def storage_summary():
     return jsonify({"by_source": result})
 
 
+# Guards manual retention trigger so the unauthenticated endpoint can't be
+# used to DoS CPU/S3 by POSTing it in a loop.
+_retention_lock = __import__("threading").Lock()
+
+
+@system_bp.get("/retention")
+def get_retention_policy():
+    """Return the active retention policy (DB override falling back to env)."""
+    from flask import current_app
+    from app.models.setting import get_int
+
+    app = current_app
+    raw = get_int("retention_raw_days",        app.config.get("RETENTION_RAW_DAYS", 7))
+    comp = get_int("retention_compressed_days", app.config.get("RETENTION_COMPRESSED_DAYS", 365))
+    hour = get_int("compression_hour",          app.config.get("COMPRESSION_HOUR", 2))
+    return jsonify({
+        "retention_raw_days":        raw,
+        "retention_compressed_days": comp,
+        "compression_hour":          hour,
+    })
+
+
+@system_bp.put("/retention")
+def update_retention_policy():
+    """Edit retention policy from the dashboard. Changes are read on next run."""
+    from app.models.setting import set_setting
+
+    data = request.get_json(force=True, silent=True) or {}
+    updated = {}
+
+    if "retention_raw_days" in data:
+        try:
+            v = int(data["retention_raw_days"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "retention_raw_days must be an integer"}), 400
+        if v < 1 or v > 3650:
+            return jsonify({"error": "retention_raw_days out of range (1..3650)"}), 400
+        set_setting("retention_raw_days", v)
+        updated["retention_raw_days"] = v
+
+    if "retention_compressed_days" in data:
+        try:
+            v = int(data["retention_compressed_days"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "retention_compressed_days must be an integer"}), 400
+        if v < 0 or v > 36500:
+            return jsonify({"error": "retention_compressed_days out of range (0..36500)"}), 400
+        set_setting("retention_compressed_days", v)
+        updated["retention_compressed_days"] = v
+
+    if "compression_hour" in data:
+        try:
+            v = int(data["compression_hour"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "compression_hour must be an integer"}), 400
+        if v < 0 or v > 23:
+            return jsonify({"error": "compression_hour out of range (0..23)"}), 400
+        set_setting("compression_hour", v)
+        updated["compression_hour"] = v
+
+    return jsonify({"updated": updated})
+
+
 @system_bp.post("/retention")
 def trigger_retention():
     """Manually kick off the retention/compression job in a background thread."""
@@ -267,11 +345,17 @@ def trigger_retention():
     from app.recorder.retention import run_retention
     from flask import current_app
 
+    if not _retention_lock.acquire(blocking=False):
+        return jsonify({"error": "Retention job already running"}), 409
+
     app = current_app._get_current_object()
 
     def _run():
-        with app.app_context():
-            run_retention(app)
+        try:
+            with app.app_context():
+                run_retention(app)
+        finally:
+            _retention_lock.release()
 
     t = threading.Thread(target=_run, daemon=True, name="manual-retention")
     t.start()
@@ -284,10 +368,12 @@ def queue_status():
     from app.recorder.uploader import uploader
     from app.models.chunk import Chunk
 
+    # Cap so a long S3 outage's backlog can't build a huge JSON blob
     pending = (
         Chunk.query
         .filter(Chunk.upload_status.in_(["pending", "uploading"]))
         .order_by(Chunk.started_at)
+        .limit(500)
         .all()
     )
     return jsonify({
