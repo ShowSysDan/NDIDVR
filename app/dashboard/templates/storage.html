@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% block title %}Storage — NDI Recorder{% endblock %}
+
+{% block head %}
+<style>
+  .storage-bar-wrap { display: flex; align-items: center; gap: 10px; }
+  .storage-bar { flex: 1; background: var(--border); border-radius: 4px; height: 8px; overflow: hidden; }
+  .storage-bar-fill { height: 100%; border-radius: 4px; }
+  .storage-bar-raw  { background: var(--accent); }
+  .storage-bar-comp { background: var(--accent2); }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 4px; }
+
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+  @media (max-width: 800px) { .kpi-grid { grid-template-columns: repeat(2,1fr); } }
+
+  .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+  .kpi-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing:.05em; color: var(--muted); margin-bottom: 6px; }
+  .kpi-value { font-size: 26px; font-weight: 700; line-height: 1; }
+  .kpi-sub   { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .retention-badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header flex items-center gap-8">
+  <div>
+    <h1>Storage</h1>
+    <p>S3 usage per source — all downloads proxy through this server</p>
+  </div>
+  <div class="ml-auto">
+    <button class="btn btn-ghost" onclick="triggerRetention()">🗜 Run compression now</button>
+  </div>
+</div>
+
+<!-- ── KPIs ─────────────────────────────────────────────────────────────────── -->
+<div class="kpi-grid">
+  <div class="kpi">
+    <div class="kpi-label">Total Raw</div>
+    <div class="kpi-value">{{ total_raw_gb }} <span style="font-size:14px;color:var(--muted)">GB</span></div>
+    <div class="kpi-sub">uncompressed on S3</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Total Compressed</div>
+    <div class="kpi-value">{{ total_comp_gb }} <span style="font-size:14px;color:var(--muted)">GB</span></div>
+    <div class="kpi-sub">H.265 long-term archive</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Active Sources</div>
+    <div class="kpi-value">{{ rows | length }}</div>
+    <div class="kpi-sub">with recordings</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Retention Window</div>
+    <div class="kpi-value" id="retention-days">—</div>
+    <div class="kpi-sub">days raw, then compress</div>
+  </div>
+</div>
+
+<!-- ── Per-source breakdown ──────────────────────────────────────────────────── -->
+<div class="card" style="padding:0;overflow:hidden">
+  {% if not rows %}
+  <div style="text-align:center;padding:48px;color:var(--muted)">
+    No recordings yet. Start recording and chunks will appear here after upload.
+  </div>
+  {% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>Chunks</th>
+        <th>Raw (GB)</th>
+        <th>Compressed (GB)</th>
+        <th style="min-width:200px">Usage</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% set max_gb = rows | map(attribute='raw_gb') | max %}
+      {% for row in rows %}
+      {% set pct = (row.raw_gb / max_gb * 100) if max_gb > 0 else 0 %}
+      <tr>
+        <td style="font-weight:600">{{ row.label }}</td>
+        <td class="text-muted">{{ row.count }}</td>
+        <td>
+          {% if row.raw_gb > 0 %}
+          <span style="font-weight:600">{{ row.raw_gb }}</span>
+          {% else %}
+          <span class="text-muted">—</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if row.comp_gb > 0 %}
+          <span style="font-weight:600;color:var(--accent2)">{{ row.comp_gb }}</span>
+          {% else %}
+          <span class="text-muted">—</span>
+          {% endif %}
+        </td>
+        <td>
+          <div class="storage-bar-wrap">
+            <div class="storage-bar">
+              <div class="storage-bar-fill storage-bar-raw" style="width:{{ pct | round(1) }}%"></div>
+            </div>
+            <span class="text-muted text-sm" style="white-space:nowrap;min-width:40px">
+              {{ row.raw_gb }} GB
+            </span>
+          </div>
+        </td>
+        <td>
+          {% if row.compressed_count > 0 %}
+          <span class="badge badge-green">{{ row.compressed_count }} compressed</span>
+          {% else %}
+          <span class="badge badge-blue">raw only</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+
+<!-- ── Legend + info ─────────────────────────────────────────────────────────── -->
+<div class="flex gap-8 items-center" style="margin-top:12px">
+  <span class="text-muted text-sm">
+    <span class="legend-dot" style="background:var(--accent)"></span>Raw (H.264)
+  </span>
+  <span class="text-muted text-sm">
+    <span class="legend-dot" style="background:var(--accent2)"></span>Compressed (H.265, applied after retention window)
+  </span>
+  <span class="text-muted text-sm ml-auto">
+    Compression runs nightly. All S3 access is proxied — no direct URLs exposed.
+  </span>
+</div>
+
+<!-- ── Upload queue ───────────────────────────────────────────────────────────── -->
+<div style="margin-top:20px">
+  <div class="card-title mb-8">Upload Queue</div>
+  <div class="card">
+    <div class="flex items-center gap-8" id="queue-status">
+      <span style="font-size:24px;font-weight:700" id="queue-depth">—</span>
+      <span class="text-muted">chunks pending upload</span>
+      <span class="text-muted text-sm ml-auto" id="queue-updated"></span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function loadHealth() {
+  try {
+    const resp = await fetch('/api/system/health');
+    const data = await resp.json();
+    document.getElementById('queue-depth').textContent   = data.upload_queue_depth;
+    document.getElementById('retention-days').textContent = '7'; // loaded from env ideally
+    document.getElementById('queue-updated').textContent =
+      'Updated ' + new Date().toLocaleTimeString();
+  } catch(e) {}
+}
+
+async function triggerRetention() {
+  if (!confirm('Run compression now? This will download, re-encode, and re-upload chunks older than the retention window. It may take a while.')) return;
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  try {
+    const resp = await fetch('/api/system/retention', { method: 'POST' });
+    const data = await resp.json();
+    alert(data.message || 'Retention job started in background.');
+  } catch(e) {
+    alert('Failed to trigger retention job.');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🗜 Run compression now';
+  }
+}
+
+loadHealth();
+setInterval(loadHealth, 10000);
+</script>
+{% endblock %}

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}500 — NDI Recorder{% endblock %}
+{% block content %}
+<div style="text-align:center;padding:80px 16px">
+  <div style="font-size:64px;margin-bottom:16px">💥</div>
+  <h1 style="font-size:32px;font-weight:700;margin-bottom:8px">500</h1>
+  <p style="color:var(--muted);margin-bottom:8px">Something went wrong on the server.</p>
+  <p style="color:var(--muted);font-size:13px;margin-bottom:24px">Check the logs: <code>journalctl -u ndi-recorder -n 50</code></p>
+  <a href="/" class="btn btn-primary">← Back to dashboard</a>
+</div>
+{% endblock %}

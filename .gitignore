@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Environment / secrets — NEVER commit
+.env
+
+# Database
+*.db
+*.sqlite3
+
+# NDI buffer (local video files)
+/var/ndi-recorder/
+/tmp/ndi_buffer/
+/tmp/ndi_rec_*/
+/tmp/ndi_compress_*/
+*.mp4
+*.mkv
+*.mxf
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Alembic
+migrations/versions/*.pyc
+
+# Ruff / linters
+.ruff_cache/
+
+# gunicorn
+gunicorn.pid

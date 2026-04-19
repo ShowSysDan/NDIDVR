@@ -1,0 +1,34 @@
+# NDI Recorder — Python dependencies
+# Install: pip install -r requirements.txt
+
+# Web framework
+flask>=3.0
+flask-sqlalchemy>=3.1
+flask-socketio>=5.3
+gunicorn>=21.2
+eventlet>=0.35
+
+# NDI capture
+ndi-python>=0.0.2
+
+# S3 storage
+boto3>=1.34
+
+# Database
+psycopg2-binary>=2.9
+sqlalchemy>=2.0
+alembic>=1.13
+
+# Scheduling
+apscheduler>=3.10
+
+# System monitoring
+psutil>=5.9
+
+# Utilities
+python-dotenv>=1.0
+numpy>=1.26        # audio frame interleaving
+
+# Dev / test
+pytest>=8.0
+pytest-flask>=1.3

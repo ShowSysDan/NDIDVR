@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}Settings — NDI Recorder{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Settings</h1>
+  <p>Source management and quality profiles</p>
+</div>
+
+<div class="grid-2" style="gap:24px">
+
+  <!-- Sources -->
+  <div>
+    <div class="card-title mb-8">Sources</div>
+    <div class="card" style="padding:0;overflow:hidden">
+      <table>
+        <thead>
+          <tr><th>Source</th><th>Quality</th><th>Enabled</th><th></th></tr>
+        </thead>
+        <tbody>
+          {% for src in sources %}
+          <tr>
+            <td>
+              <div style="font-weight:500">{{ src.label }}</div>
+              <div class="text-muted text-sm mono">{{ src.ndi_name }}</div>
+            </td>
+            <td>
+              <select onchange="setQuality({{ src.id }}, this.value)" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 8px;font-size:12px">
+                {% for k, v in profiles.items() %}
+                {% if k != 'compressed' %}
+                <option value="{{ k }}" {% if src.quality == k %}selected{% endif %}>{{ v.label }}</option>
+                {% endif %}
+                {% endfor %}
+              </select>
+            </td>
+            <td>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" {% if src.enabled %}checked{% endif %}
+                       onchange="setEnabled({{ src.id }}, this.checked)">
+                <span class="text-sm">{{ 'On' if src.enabled else 'Off' }}</span>
+              </label>
+            </td>
+            <td>
+              <input type="text" placeholder="Display name…" value="{{ src.display_name or '' }}"
+                     style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 8px;font-size:12px;width:140px"
+                     onblur="setName({{ src.id }}, this.value)">
+            </td>
+          </tr>
+          {% else %}
+          <tr><td colspan="4" style="text-align:center;padding:32px;color:var(--muted)">
+            No sources yet. <a href="#" onclick="scan()" style="color:var(--accent)">Scan the network.</a>
+          </td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div style="margin-top:10px">
+      <button class="btn btn-ghost" onclick="scan()">🔍 Scan for NDI sources</button>
+    </div>
+  </div>
+
+  <!-- Quality profiles info -->
+  <div>
+    <div class="card-title mb-8">Quality Profiles</div>
+    {% for k, v in profiles.items() %}
+    <div class="card mb-8">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <span class="badge {% if k == 'full' %}badge-amber{% elif k == 'compressed' %}badge-gray{% else %}badge-blue{% endif %}">
+          {{ v.label }}
+        </span>
+        <span class="text-muted text-sm">{{ '~' + v.approx_gb_per_hour|string + ' GB/hr' }}</span>
+      </div>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:8px">{{ v.description }}</p>
+      <div class="mono text-sm" style="color:var(--muted)">
+        {{ v.vcodec }} | preset:{{ v.preset }} | CRF {{ v.crf }} | {{ v.acodec }} {{ v.audio_bitrate }}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function setQuality(id, q) {
+  await fetch(`/api/sources/${id}/quality`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({quality: q}),
+  });
+}
+async function setEnabled(id, enabled) {
+  await fetch(`/api/sources/${id}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enabled}),
+  });
+}
+async function setName(id, name) {
+  await fetch(`/api/sources/${id}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({display_name: name}),
+  });
+}
+async function scan() {
+  const resp = await fetch('/api/sources/scan', {method:'POST'});
+  const data = await resp.json();
+  alert(`Found ${data.sources_found} source(s).`);
+  location.reload();
+}
+</script>
+{% endblock %}

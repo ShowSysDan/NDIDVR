@@ -1,0 +1,41 @@
+[Unit]
+Description=NDI Recorder
+Documentation=https://github.com/your-org/ndi-recorder
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ndi
+Group=ndi
+WorkingDirectory=/opt/ndi-recorder
+EnvironmentFile=/opt/ndi-recorder/.env
+
+# The NDI SDK library path — adjust if installed elsewhere
+Environment=LD_LIBRARY_PATH=/usr/lib/ndi
+
+ExecStart=/opt/ndi-recorder/venv/bin/gunicorn \
+    -c /opt/ndi-recorder/gunicorn.conf.py \
+    wsgi:app
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Logging — captured by journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ndi-recorder
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

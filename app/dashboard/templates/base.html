@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}NDI Recorder{% endblock %}</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0f1117;
+      --surface:  #1a1d27;
+      --border:   #2a2d3a;
+      --accent:   #3b82f6;
+      --accent2:  #10b981;
+      --warn:     #f59e0b;
+      --danger:   #ef4444;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --nav-h:    56px;
+    }
+
+    body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif;
+           font-size: 14px; min-height: 100vh; }
+
+    /* ── Nav ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; height: var(--nav-h);
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; padding: 0 24px; gap: 32px; z-index: 100;
+    }
+    .nav-brand { font-weight: 700; font-size: 16px; color: var(--text); text-decoration: none;
+                 display: flex; align-items: center; gap: 8px; }
+    .nav-brand::before { content: "⬤"; color: var(--danger); font-size: 10px; animation: pulse 1.5s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    nav a { color: var(--muted); text-decoration: none; padding: 6px 0;
+            border-bottom: 2px solid transparent; transition: color .15s, border-color .15s; }
+    nav a:hover, nav a.active { color: var(--text); border-color: var(--accent); }
+    .nav-right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+    #nav-cpu { font-size: 12px; color: var(--muted); }
+
+    /* ── Layout ── */
+    .page { margin-top: var(--nav-h); padding: 24px; max-width: 1400px; margin-left: auto; margin-right: auto; }
+    .page-header { margin-bottom: 20px; }
+    .page-header h1 { font-size: 20px; font-weight: 600; }
+    .page-header p { color: var(--muted); margin-top: 4px; font-size: 13px; }
+
+    /* ── Cards ── */
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    .card-title { font-size: 12px; font-weight: 600; text-transform: uppercase;
+                  letter-spacing: .05em; color: var(--muted); margin-bottom: 12px; }
+
+    /* ── Grid ── */
+    .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+    @media (max-width: 900px) { .grid-4, .grid-3 { grid-template-columns: repeat(2,1fr); } }
+    @media (max-width: 600px) { .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; } }
+
+    /* ── Badges ── */
+    .badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px;
+             border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .badge-green  { background: #052e16; color: var(--accent2); border: 1px solid #166534; }
+    .badge-blue   { background: #1e3a5f; color: #93c5fd;        border: 1px solid #1d4ed8; }
+    .badge-amber  { background: #451a03; color: #fcd34d;        border: 1px solid #92400e; }
+    .badge-red    { background: #450a0a; color: #fca5a5;        border: 1px solid #991b1b; }
+    .badge-gray   { background: #1e293b; color: var(--muted);   border: 1px solid var(--border); }
+    .dot { width: 6px; height: 6px; border-radius: 50%; }
+
+    /* ── Buttons ── */
+    .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px;
+           border-radius: 6px; font-size: 13px; font-weight: 500; border: none;
+           cursor: pointer; transition: opacity .15s; text-decoration: none; }
+    .btn:hover { opacity: .85; }
+    .btn-primary   { background: var(--accent);  color: #fff; }
+    .btn-success   { background: var(--accent2); color: #fff; }
+    .btn-danger    { background: var(--danger);  color: #fff; }
+    .btn-ghost     { background: transparent; color: var(--text); border: 1px solid var(--border); }
+    .btn-sm { padding: 4px 10px; font-size: 12px; }
+
+    /* ── Table ── */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 8px 12px; color: var(--muted); font-weight: 600;
+         font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+         border-bottom: 1px solid var(--border); }
+    td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,.02); }
+
+    /* ── Progress bar ── */
+    .bar-track { background: var(--border); border-radius: 4px; height: 6px; overflow: hidden; }
+    .bar-fill  { height: 100%; border-radius: 4px; transition: width .3s; }
+    .bar-cpu   { background: var(--accent); }
+    .bar-mem   { background: var(--accent2); }
+    .bar-disk  { background: var(--warn); }
+
+    /* ── Misc ── */
+    .text-muted { color: var(--muted); }
+    .text-sm    { font-size: 12px; }
+    .mono       { font-family: 'Menlo', 'Consolas', monospace; font-size: 12px; }
+    .flex       { display: flex; }
+    .items-center { align-items: center; }
+    .gap-8      { gap: 8px; }
+    .gap-4      { gap: 4px; }
+    .ml-auto    { margin-left: auto; }
+    .mb-16      { margin-bottom: 16px; }
+    .mb-8       { margin-bottom: 8px; }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-brand">NDI Recorder</a>
+  <a href="/" id="nav-dash" class="{% if request.path == '/' %}active{% endif %}">Dashboard</a>
+  <a href="/browse" id="nav-browse" class="{% if request.path.startswith('/browse') %}active{% endif %}">Browse</a>
+  <a href="/storage" id="nav-storage" class="{% if request.path == '/storage' %}active{% endif %}">Storage</a>
+  <a href="/settings" id="nav-settings" class="{% if request.path == '/settings' %}active{% endif %}">Settings</a>
+  <div class="nav-right">
+    <span id="nav-cpu" title="Total CPU">CPU —%</span>
+  </div>
+</nav>
+
+<div class="page">
+  {% block content %}{% endblock %}
+</div>
+
+<script>
+  // Global SocketIO connection for system stats
+  const statsSocket = io('/stats');
+  statsSocket.on('system_stats', data => {
+    document.getElementById('nav-cpu').textContent = `CPU ${data.total_cpu.toFixed(0)}%`;
+    if (window._onStats) window._onStats(data);
+  });
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

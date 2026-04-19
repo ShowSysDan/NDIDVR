@@ -1,0 +1,274 @@
+{% extends "base.html" %}
+{% block title %}Browse Recordings — NDI Recorder{% endblock %}
+
+{% block head %}
+<style>
+  .browse-layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
+  @media (max-width: 768px) { .browse-layout { grid-template-columns: 1fr; } }
+
+  /* Sidebar */
+  .sidebar {}
+  .sidebar-section { margin-bottom: 8px; }
+  .sidebar-label { font-size: 11px; font-weight: 600; text-transform: uppercase;
+                   letter-spacing: .05em; color: var(--muted); padding: 8px 12px 4px; }
+  .sidebar-item { display: flex; align-items: center; justify-content: space-between;
+                  padding: 7px 12px; border-radius: 6px; cursor: pointer;
+                  color: var(--muted); font-size: 13px; text-decoration: none;
+                  transition: background .1s, color .1s; }
+  .sidebar-item:hover { background: var(--border); color: var(--text); }
+  .sidebar-item.active { background: rgba(59,130,246,.15); color: var(--accent); }
+  .sidebar-count { font-size: 11px; background: var(--border); border-radius: 8px;
+                   padding: 1px 6px; }
+
+  /* Filters */
+  .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
+  .filters select, .filters input[type=date] {
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  }
+
+  /* Chunk table */
+  .chunk-filename { font-family: monospace; font-size: 12px; color: var(--muted); }
+  .chunk-time { font-weight: 600; white-space: nowrap; }
+  .chunk-size { font-size: 12px; white-space: nowrap; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+
+  /* Download button */
+  .dl-btn { display: inline-flex; align-items: center; gap: 4px;
+             padding: 4px 10px; border-radius: 5px; font-size: 12px; font-weight: 500;
+             background: var(--accent); color: #fff; text-decoration: none;
+             transition: opacity .15s; }
+  .dl-btn:hover { opacity: .85; }
+  .dl-btn[disabled] { opacity: .4; pointer-events: none; background: var(--border); color: var(--muted); }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 48px 16px; color: var(--muted); }
+  .empty-icon { font-size: 40px; margin-bottom: 12px; }
+
+  /* Pagination */
+  .pagination { display: flex; gap: 6px; justify-content: center; margin-top: 16px; }
+  .pagination a, .pagination span {
+    padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+    font-size: 13px; text-decoration: none; color: var(--text);
+    background: var(--surface);
+  }
+  .pagination a:hover { border-color: var(--accent); color: var(--accent); }
+  .pagination .current { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .pagination .disabled { opacity: .3; pointer-events: none; }
+
+  /* Source group header */
+  .group-header { background: rgba(255,255,255,.03); }
+  .group-header td { font-weight: 600; font-size: 13px; padding: 10px 12px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Browse Recordings</h1>
+  <p>All recordings are streamed through this server — no direct S3 access</p>
+</div>
+
+<div class="browse-layout">
+
+  <!-- ── Sidebar ──────────────────────────────────────────────────────────── -->
+  <aside>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Last 14 Days</div>
+      {% for day in date_range %}
+      <a href="/browse?date={{ day.date }}{% if selected_source_id %}&source_id={{ selected_source_id }}{% endif %}"
+         class="sidebar-item {% if day.date == selected_date %}active{% endif %}">
+        {{ day.date }}
+        {% if day.count %}<span class="sidebar-count">{{ day.count }}</span>{% endif %}
+      </a>
+      {% endfor %}
+    </div>
+
+    <div class="sidebar-section" style="margin-top:16px">
+      <div class="sidebar-label">Filter by Source</div>
+      <a href="/browse?date={{ selected_date }}"
+         class="sidebar-item {% if not selected_source_id %}active{% endif %}">
+        All sources
+      </a>
+      {% for src in sources %}
+      <a href="/browse?date={{ selected_date }}&source_id={{ src.id }}"
+         class="sidebar-item {% if selected_source_id == src.id %}active{% endif %}">
+        {{ src.label }}
+      </a>
+      {% endfor %}
+    </div>
+
+  </aside>
+
+  <!-- ── Main content ─────────────────────────────────────────────────────── -->
+  <main>
+
+    <!-- Filters bar -->
+    <div class="filters">
+      <input type="date" id="date-picker" value="{{ selected_date }}"
+             onchange="navigate()" max="{{ today }}">
+      <select id="source-picker" onchange="navigate()">
+        <option value="">All sources</option>
+        {% for src in sources %}
+        <option value="{{ src.id }}" {% if selected_source_id == src.id %}selected{% endif %}>
+          {{ src.label }}
+        </option>
+        {% endfor %}
+      </select>
+      <span class="text-muted text-sm" style="margin-left:auto">
+        {{ pagination.total }} chunk{{ 's' if pagination.total != 1 }}
+      </span>
+    </div>
+
+    {% if not chunks %}
+    <div class="card empty">
+      <div class="empty-icon">📭</div>
+      <p>No recordings found for {{ selected_date }}</p>
+      {% if selected_source_id %}
+      <p style="margin-top:8px"><a href="/browse?date={{ selected_date }}" style="color:var(--accent)">Clear source filter</a></p>
+      {% endif %}
+    </div>
+    {% else %}
+
+    <div class="card" style="padding:0;overflow:hidden">
+      <table>
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Source</th>
+            <th>Quality</th>
+            <th>Duration</th>
+            <th>Size</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% set ns = namespace(current_source=None) %}
+          {% for chunk in chunks %}
+
+          {% if not selected_source_id and chunk.source.label != ns.current_source %}
+          {% set ns.current_source = chunk.source.label %}
+          <tr class="group-header">
+            <td colspan="7">📹 {{ chunk.source.label }}</td>
+          </tr>
+          {% endif %}
+
+          <tr>
+            <!-- Time window -->
+            <td class="chunk-time">
+              {{ chunk.started_at.strftime('%H:%M') if chunk.started_at else '—' }}
+              {% if chunk.ended_at %}
+                <span class="text-muted">→ {{ chunk.ended_at.strftime('%H:%M') }}</span>
+              {% else %}
+                <span class="badge badge-green" style="margin-left:4px">● LIVE</span>
+              {% endif %}
+            </td>
+
+            <!-- Source -->
+            <td>
+              {% if selected_source_id %}
+              {{ chunk.source.label }}
+              {% else %}
+              <span class="text-muted text-sm">{{ chunk.source.label }}</span>
+              {% endif %}
+            </td>
+
+            <!-- Quality -->
+            <td>
+              <span class="badge {% if chunk.quality == 'full' %}badge-amber{% elif chunk.quality == 'compressed' %}badge-gray{% else %}badge-blue{% endif %}">
+                {{ chunk.quality }}
+              </span>
+              {% if chunk.compressed %}
+              <span class="badge badge-gray" style="margin-left:4px" title="H.265 compressed">cmp</span>
+              {% endif %}
+            </td>
+
+            <!-- Duration -->
+            <td class="text-muted text-sm">
+              {% if chunk.duration_seconds %}
+                {% set m = (chunk.duration_seconds // 60)|int %}
+                {% set s = (chunk.duration_seconds % 60)|int %}
+                {{ '%d:%02d'|format(m, s) }}
+              {% else %}
+                <span style="color:var(--accent2)">recording…</span>
+              {% endif %}
+            </td>
+
+            <!-- Size -->
+            <td class="chunk-size">{{ chunk.size_human }}</td>
+
+            <!-- Upload status -->
+            <td>
+              {% if chunk.upload_status == 'uploaded' %}
+              <span class="badge badge-green">✓ S3</span>
+              {% elif chunk.upload_status == 'uploading' %}
+              <span class="badge badge-amber">↑ uploading</span>
+              {% elif chunk.upload_status == 'failed' %}
+              <span class="badge badge-red">✗ failed</span>
+              {% else %}
+              <span class="badge badge-gray">pending</span>
+              {% endif %}
+            </td>
+
+            <!-- Download -->
+            <td style="text-align:right">
+              {% set available = chunk.upload_status == 'uploaded' or chunk.local_path %}
+              <a href="/api/recordings/{{ chunk.id }}/download"
+                 class="dl-btn"
+                 {% if not available %}disabled{% endif %}
+                 download="{{ chunk.filename }}">
+                ↓ Download
+              </a>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Pagination -->
+    {% if pagination.pages > 1 %}
+    <div class="pagination">
+      {% if pagination.has_prev %}
+      <a href="/browse?date={{ selected_date }}{% if selected_source_id %}&source_id={{ selected_source_id }}{% endif %}&page={{ pagination.prev_num }}">← Prev</a>
+      {% else %}
+      <span class="disabled">← Prev</span>
+      {% endif %}
+
+      {% for p in pagination.iter_pages(left_edge=1, right_edge=1, left_current=2, right_current=2) %}
+        {% if p %}
+          {% if p == pagination.page %}
+          <span class="current">{{ p }}</span>
+          {% else %}
+          <a href="/browse?date={{ selected_date }}{% if selected_source_id %}&source_id={{ selected_source_id }}{% endif %}&page={{ p }}">{{ p }}</a>
+          {% endif %}
+        {% else %}
+        <span>…</span>
+        {% endif %}
+      {% endfor %}
+
+      {% if pagination.has_next %}
+      <a href="/browse?date={{ selected_date }}{% if selected_source_id %}&source_id={{ selected_source_id }}{% endif %}&page={{ pagination.next_num }}">Next →</a>
+      {% else %}
+      <span class="disabled">Next →</span>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% endif %}
+
+  </main>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function navigate() {
+  const date = document.getElementById('date-picker').value;
+  const src  = document.getElementById('source-picker').value;
+  let url = `/browse?date=${date}`;
+  if (src) url += `&source_id=${src}`;
+  window.location = url;
+}
+</script>
+{% endblock %}

@@ -1,0 +1,412 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — NDI Recorder{% endblock %}
+
+{% block head %}
+<style>
+  .kpi-row { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 16px; }
+  @media(max-width:900px){ .kpi-row { grid-template-columns: repeat(2,1fr); } }
+
+  .kpi { background:var(--surface); border:1px solid var(--border); border-radius:8px;
+         padding:14px 16px; }
+  .kpi-label { font-size:11px; font-weight:600; text-transform:uppercase;
+               letter-spacing:.05em; color:var(--muted); margin-bottom:6px; }
+  .kpi-value { font-size:26px; font-weight:700; line-height:1; }
+  .kpi-sub   { font-size:12px; color:var(--muted); margin-top:4px; }
+
+  /* Source cards */
+  .source-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+  @media(max-width:1100px){ .source-grid { grid-template-columns:repeat(2,1fr); } }
+  @media(max-width:650px) { .source-grid { grid-template-columns:1fr; } }
+
+  .src-card { background:var(--surface); border:1px solid var(--border);
+              border-radius:8px; padding:14px; transition:border-color .2s; }
+  .src-card.recording  { border-color:#166534; }
+  .src-card.error      { border-color:#991b1b; }
+  .src-card.reconnecting { border-color:#92400e; }
+
+  .src-name  { font-weight:600; margin:6px 0 3px; font-size:14px; }
+  .src-meta  { font-size:11px; color:var(--muted); font-family:monospace; }
+  .src-chunk { font-size:12px; color:var(--muted); margin-top:6px; }
+  .src-error { font-size:12px; color:var(--danger); margin-top:6px;
+               background:rgba(239,68,68,.07); border-radius:5px; padding:5px 8px; }
+
+  .src-progress { margin-top:8px; }
+  .src-progress-bar { height:3px; background:var(--border); border-radius:2px; overflow:hidden; }
+  .src-progress-fill { height:100%; background:var(--accent2); border-radius:2px;
+                       transition:width 1s linear; }
+  .src-progress-label { display:flex; justify-content:space-between;
+                        font-size:11px; color:var(--muted); margin-top:3px; }
+
+  .src-actions { display:flex; gap:6px; margin-top:10px; flex-wrap:wrap; }
+
+  /* Rotation countdown */
+  #rotation-countdown { font-variant-numeric:tabular-nums; }
+
+  /* Alert banner */
+  .alert-bar { border-radius:7px; padding:10px 14px; margin-bottom:14px;
+               font-size:13px; display:flex; align-items:center; gap:8px; }
+  .alert-bar-warn  { background:rgba(245,158,11,.1); border:1px solid #92400e; color:#fcd34d; }
+  .alert-bar-error { background:rgba(239,68,68,.1);  border:1px solid #991b1b; color:#fca5a5; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header flex items-center gap-8">
+  <div>
+    <h1>Dashboard</h1>
+    <p>Live recording status and system health</p>
+  </div>
+  <div class="ml-auto flex items-center gap-8">
+    <span class="text-muted text-sm">
+      Next rotation in <strong id="rotation-countdown">—</strong>
+    </span>
+    <button class="btn btn-ghost btn-sm" onclick="scanSources()">🔍 Scan</button>
+  </div>
+</div>
+
+<!-- Alert banners (filled by JS) -->
+<div id="alerts"></div>
+
+<!-- ── KPIs ─────────────────────────────────────────────────────────────────── -->
+<div class="kpi-row">
+  <div class="kpi">
+    <div class="kpi-label">CPU</div>
+    <div class="kpi-value" id="kpi-cpu">—<span style="font-size:14px;color:var(--muted)">%</span></div>
+    <div class="bar-track" style="margin-top:8px"><div class="bar-fill bar-cpu" id="bar-cpu" style="width:0%"></div></div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Memory</div>
+    <div class="kpi-value" id="kpi-mem">—<span style="font-size:14px;color:var(--muted)">%</span></div>
+    <div class="bar-track" style="margin-top:8px"><div class="bar-fill bar-mem" id="bar-mem" style="width:0%"></div></div>
+    <div class="kpi-sub" id="kpi-mem-detail"></div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Buffer Disk</div>
+    <div class="kpi-value" id="kpi-disk">—<span style="font-size:14px;color:var(--muted)">%</span></div>
+    <div class="bar-track" style="margin-top:8px"><div class="bar-fill bar-disk" id="bar-disk" style="width:0%"></div></div>
+    <div class="kpi-sub" id="kpi-disk-detail"></div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Upload Queue</div>
+    <div class="kpi-value" id="kpi-queue">—</div>
+    <div class="kpi-sub">pending chunks</div>
+  </div>
+</div>
+
+<!-- ── CPU Graph ─────────────────────────────────────────────────────────────── -->
+<div class="card mb-16">
+  <div class="card-title flex items-center gap-8">
+    CPU per Core
+    <span class="badge badge-gray" id="core-badge">—</span>
+    <span class="ml-auto text-muted text-sm">60-second window</span>
+  </div>
+  <canvas id="cpuChart" height="80"></canvas>
+</div>
+
+<!-- ── Source cards ───────────────────────────────────────────────────────────── -->
+<div class="flex items-center gap-8 mb-8">
+  <div class="card-title" style="margin:0">Sources</div>
+  <span class="badge badge-gray" id="source-count-badge">0 active</span>
+  <a href="/browse" class="btn btn-ghost btn-sm ml-auto">📁 Browse recordings</a>
+</div>
+
+<div class="source-grid" id="source-grid">
+  <div class="card" style="grid-column:1/-1;text-align:center;padding:40px;color:var(--muted)" id="no-sources-msg">
+    Waiting for sources… <span id="spinner">⟳</span>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Constants from server config ───────────────────────────────────────────────
+const GB_PER_HOUR = {
+  archive:    3.5,
+  full:       15.0,
+  compressed: 1.5,
+};
+
+// ── CPU chart ─────────────────────────────────────────────────────────────────
+const MAX_PTS = 60;
+const labels  = Array(MAX_PTS).fill('');
+let chart = null;
+
+function buildChart(numCores) {
+  const COLORS = [
+    '#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6',
+    '#06b6d4','#f97316','#84cc16','#ec4899','#14b8a6',
+    '#a855f7','#fb923c','#22c55e','#e879f9','#38bdf8',
+    '#fbbf24','#34d399','#60a5fa','#f87171','#c084fc',
+  ];
+  const datasets = [];
+  for (let i = 0; i < numCores; i++) {
+    datasets.push({
+      label: `Core ${i}`,
+      data: Array(MAX_PTS).fill(0),
+      borderColor: COLORS[i % COLORS.length],
+      backgroundColor: 'transparent',
+      borderWidth: 1.5, pointRadius: 0, tension: 0.3,
+    });
+  }
+  datasets.push({
+    label: 'Total',
+    data: Array(MAX_PTS).fill(0),
+    borderColor: '#fff',
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderWidth: 2.5, pointRadius: 0, tension: 0.3, fill: true,
+  });
+
+  const ctx = document.getElementById('cpuChart').getContext('2d');
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, animation: false,
+      scales: {
+        x: { display: false },
+        y: {
+          min: 0, max: 100,
+          ticks: { color: '#64748b', callback: v => v + '%' },
+          grid:  { color: '#2a2d3a' },
+        },
+      },
+      plugins: {
+        legend: { labels: { color: '#64748b', boxWidth: 12, font: { size: 11 } } },
+      },
+      interaction: { mode: 'index', intersect: false },
+    },
+  });
+  document.getElementById('core-badge').textContent = `${numCores} cores`;
+}
+
+function pushCpu(perCpu, total) {
+  if (!chart) buildChart(perCpu.length);
+  perCpu.forEach((v, i) => {
+    const ds = chart.data.datasets[i];
+    if (ds) { ds.data.shift(); ds.data.push(v); }
+  });
+  const last = chart.data.datasets[chart.data.datasets.length - 1];
+  last.data.shift(); last.data.push(total);
+  chart.update('none');
+}
+
+// ── Rotation countdown ────────────────────────────────────────────────────────
+function updateCountdown() {
+  const now = new Date();
+  const m   = now.getMinutes();
+  const s   = now.getSeconds();
+  const toNext = (m < 30 ? (30 - m) : (60 - m)) * 60 - s;
+  const mm = String(Math.floor(toNext / 60)).padStart(2, '0');
+  const ss = String(toNext % 60).padStart(2, '0');
+  document.getElementById('rotation-countdown').textContent = `${mm}:${ss}`;
+}
+setInterval(updateCountdown, 1000);
+updateCountdown();
+
+// ── Source card rendering ─────────────────────────────────────────────────────
+function estimatedGB(quality, chunkStartISO) {
+  if (!chunkStartISO) return null;
+  const elapsedH = (Date.now() - new Date(chunkStartISO + 'Z').getTime()) / 3600000;
+  const gbh = GB_PER_HOUR[quality] || 3.5;
+  return (elapsedH * gbh).toFixed(2);
+}
+
+function chunkProgress(chunkStartISO) {
+  if (!chunkStartISO) return 0;
+  const elapsed = (Date.now() - new Date(chunkStartISO + 'Z').getTime()) / 1000;
+  return Math.min(100, (elapsed / 1800) * 100);  // 1800s = 30min
+}
+
+function renderSources(sources) {
+  const grid = document.getElementById('source-grid');
+  const noMsg = document.getElementById('no-sources-msg');
+
+  if (!sources || sources.length === 0) {
+    if (noMsg) noMsg.style.display = '';
+    // Remove existing cards
+    grid.querySelectorAll('.src-card').forEach(el => el.remove());
+    return;
+  }
+  if (noMsg) noMsg.style.display = 'none';
+
+  document.getElementById('source-count-badge').textContent =
+    `${sources.filter(s => s.status === 'recording').length} recording`;
+
+  // Build a map of existing cards
+  const existing = {};
+  grid.querySelectorAll('.src-card[data-id]').forEach(el => {
+    existing[el.dataset.id] = el;
+  });
+
+  const seen = new Set();
+  sources.forEach(src => {
+    seen.add(String(src.source_id));
+    const pct  = chunkProgress(src.current_chunk_start);
+    const estGB = estimatedGB(src.quality, src.current_chunk_start);
+    const statusClass = src.status === 'recording' ? 'recording'
+                      : src.status === 'error'     ? 'error'
+                      : src.status.includes('reconnect') ? 'reconnecting'
+                      : '';
+
+    const qualityBadge = src.quality === 'full'
+      ? '<span class="badge badge-amber">full</span>'
+      : '<span class="badge badge-blue">archive</span>';
+
+    const statusBadge = src.status === 'recording'
+      ? '<span class="badge badge-green"><span class="dot" style="background:currentColor"></span> recording</span>'
+      : src.status === 'error'
+      ? '<span class="badge badge-red">✗ error</span>'
+      : `<span class="badge badge-amber">${src.status}</span>`;
+
+    const progressHtml = src.status === 'recording' ? `
+      <div class="src-progress">
+        <div class="src-progress-bar">
+          <div class="src-progress-fill" style="width:${pct.toFixed(1)}%"></div>
+        </div>
+        <div class="src-progress-label">
+          <span>${src.current_chunk_start ? src.current_chunk_start.substring(11,16) + ' UTC' : ''}</span>
+          <span>${estGB ? estGB + ' GB est.' : ''}</span>
+        </div>
+      </div>` : '';
+
+    const errorHtml = src.error
+      ? `<div class="src-error">⚠ ${src.error}</div>` : '';
+
+    const html = `
+      <div class="flex items-center gap-4">
+        ${statusBadge}
+        ${qualityBadge}
+      </div>
+      <div class="src-name">${src.ndi_name}</div>
+      <div class="src-meta">${src.resolution}  ${src.fps} fps</div>
+      ${progressHtml}
+      ${errorHtml}
+      <div class="src-actions">
+        <button class="btn btn-ghost btn-sm"
+                onclick="toggleQuality(${src.source_id}, '${src.quality}')">
+          ⇅ ${src.quality === 'archive' ? '→ Full' : '→ Archive'}
+        </button>
+        <button class="btn btn-ghost btn-sm"
+                onclick="toggleEnabled(${src.source_id}, true)">
+          ⏹ Disable
+        </button>
+      </div>`;
+
+    const id = String(src.source_id);
+    if (existing[id]) {
+      existing[id].className = `src-card ${statusClass}`;
+      existing[id].innerHTML = html;
+    } else {
+      const card = document.createElement('div');
+      card.className = `src-card ${statusClass}`;
+      card.dataset.id = id;
+      card.innerHTML = html;
+      grid.appendChild(card);
+    }
+  });
+
+  // Remove cards for sources no longer in the list
+  Object.keys(existing).forEach(id => {
+    if (!seen.has(id)) existing[id].remove();
+  });
+}
+
+// ── Alert banners ──────────────────────────────────────────────────────────────
+function renderAlerts(sources, diskPct) {
+  const div = document.getElementById('alerts');
+  const alerts = [];
+
+  if (diskPct > 90)
+    alerts.push({ cls:'alert-bar-error', msg:`⚠ Buffer disk at ${diskPct}% — uploads may be falling behind` });
+  else if (diskPct > 75)
+    alerts.push({ cls:'alert-bar-warn', msg:`Buffer disk at ${diskPct}%` });
+
+  const errors = (sources || []).filter(s => s.status === 'error');
+  errors.forEach(s =>
+    alerts.push({ cls:'alert-bar-error', msg:`Source "${s.ndi_name}" is in error state: ${s.error || 'unknown'}` })
+  );
+
+  div.innerHTML = alerts.map(a =>
+    `<div class="alert-bar ${a.cls}">${a.msg}</div>`
+  ).join('');
+}
+
+// ── SocketIO stats handler ─────────────────────────────────────────────────────
+window._onStats = function(data) {
+  // Nav CPU
+  document.getElementById('nav-cpu').textContent = `CPU ${data.total_cpu}%`;
+
+  // KPIs
+  document.getElementById('kpi-cpu').innerHTML =
+    `${data.total_cpu}<span style="font-size:14px;color:var(--muted)">%</span>`;
+  document.getElementById('bar-cpu').style.width = data.total_cpu + '%';
+
+  document.getElementById('kpi-mem').innerHTML =
+    `${data.mem_percent}<span style="font-size:14px;color:var(--muted)">%</span>`;
+  document.getElementById('bar-mem').style.width = data.mem_percent + '%';
+  document.getElementById('kpi-mem-detail').textContent =
+    `${data.mem_used_gb} / ${data.mem_total_gb} GB`;
+
+  document.getElementById('kpi-disk').innerHTML =
+    `${data.disk_percent}<span style="font-size:14px;color:var(--muted)">%</span>`;
+  document.getElementById('bar-disk').style.width = data.disk_percent + '%';
+  document.getElementById('kpi-disk-detail').textContent =
+    `${data.disk_used_gb} / ${data.disk_total_gb} GB`;
+
+  // CPU chart
+  pushCpu(data.per_cpu, data.total_cpu);
+
+  // Source cards from live_sources embedded in snapshot
+  if (data.live_sources !== undefined) {
+    renderSources(data.live_sources);
+    renderAlerts(data.live_sources, data.disk_percent);
+  }
+};
+
+// ── Upload queue depth (separate poll) ────────────────────────────────────────
+async function pollQueue() {
+  try {
+    const r = await fetch('/api/system/queue');
+    const d = await r.json();
+    document.getElementById('kpi-queue').textContent = d.queue_depth;
+  } catch(e) {}
+}
+pollQueue();
+setInterval(pollQueue, 10000);
+
+// ── Source actions ─────────────────────────────────────────────────────────────
+async function toggleQuality(id, current) {
+  const next = current === 'archive' ? 'full' : 'archive';
+  if (!confirm(`Switch source ${id} to "${next}"? Takes effect at next chunk rotation.`)) return;
+  await fetch(`/api/sources/${id}/quality`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({quality: next}),
+  });
+}
+
+async function toggleEnabled(id, currentlyEnabled) {
+  const action = currentlyEnabled ? 'disable' : 'enable';
+  if (!confirm(`${action.charAt(0).toUpperCase() + action.slice(1)} source ${id}?`)) return;
+  await fetch(`/api/sources/${id}`, {
+    method: 'PATCH',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: !currentlyEnabled}),
+  });
+}
+
+async function scanSources() {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '⟳ Scanning…';
+  try {
+    const r = await fetch('/api/sources/scan', {method:'POST'});
+    const d = await r.json();
+    btn.textContent = `Found ${d.sources_found}`;
+    setTimeout(() => { btn.disabled=false; btn.textContent='🔍 Scan'; }, 3000);
+  } catch(e) {
+    btn.disabled=false; btn.textContent='🔍 Scan';
+  }
+}
+</script>
+{% endblock %}
