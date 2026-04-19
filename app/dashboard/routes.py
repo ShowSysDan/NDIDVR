@@ -52,16 +52,31 @@ def browse():
         page=page, per_page=per_page, error_out=False
     )
 
-    # Sidebar: last 14 days with recording counts
+    # Sidebar: last 14 days with recording counts — grouped in a single
+    # query so the unauthenticated page isn't 14 COUNTs per pageview.
+    from app.extensions import db
+    from sqlalchemy import func
+    window_start = (datetime.utcnow() - timedelta(days=13)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    raw_counts = (
+        db.session.query(
+            func.date(Chunk.started_at),
+            func.count(Chunk.id),
+        )
+        .filter(Chunk.started_at >= window_start)
+        .group_by(func.date(Chunk.started_at))
+        .all()
+    )
+    # Postgres returns a date object; SQLite returns a str. Normalize to str.
+    day_counts: dict[str, int] = {}
+    for day, cnt in raw_counts:
+        key = day.strftime("%Y-%m-%d") if hasattr(day, "strftime") else str(day)
+        day_counts[key] = int(cnt or 0)
     date_range = []
     for i in range(14):
         d_str = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
-        d_start = datetime.strptime(d_str, "%Y-%m-%d")
-        count = Chunk.query.filter(
-            Chunk.started_at >= d_start,
-            Chunk.started_at < d_start + timedelta(days=1),
-        ).count()
-        date_range.append({"date": d_str, "count": count})
+        date_range.append({"date": d_str, "count": day_counts.get(d_str, 0)})
 
     return render_template(
         "browse.html",

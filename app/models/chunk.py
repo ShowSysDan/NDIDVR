@@ -6,10 +6,11 @@ class Chunk(db.Model):
     __tablename__ = "chunks"
 
     id = db.Column(db.Integer, primary_key=True)
-    source_id = db.Column(db.Integer, db.ForeignKey("sources.id"), nullable=False)
+    source_id = db.Column(db.Integer, db.ForeignKey("sources.id"), nullable=False, index=True)
 
-    # Timing
-    started_at = db.Column(db.DateTime, nullable=False)
+    # Timing — started_at is queried for every dashboard page and API call, so
+    # index it to keep the unauthenticated dashboard queries cheap.
+    started_at = db.Column(db.DateTime, nullable=False, index=True)
     ended_at = db.Column(db.DateTime, nullable=True)
     duration_seconds = db.Column(db.Float, nullable=True)
 

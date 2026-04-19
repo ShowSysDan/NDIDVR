@@ -1,30 +1,39 @@
 [Unit]
 Description=NDI Recorder
-Documentation=https://github.com/your-org/ndi-recorder
+Documentation=https://github.com/ShowSysDan/NDIDVR
 After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 Type=simple
+
+# Run as the service account that owns ~/ndi-recorder.
+# If you installed under a different username, change User=, Group=,
+# WorkingDirectory=, EnvironmentFile=, and ExecStart= to match.
 User=ndi
 Group=ndi
-WorkingDirectory=/opt/ndi-recorder
-EnvironmentFile=/opt/ndi-recorder/.env
+WorkingDirectory=/home/ndi/ndi-recorder
+EnvironmentFile=/home/ndi/ndi-recorder/.env
 
-# The NDI SDK library path — adjust if installed elsewhere
+# NDI SDK library path — adjust if installed elsewhere
 Environment=LD_LIBRARY_PATH=/usr/lib/ndi
 
-ExecStart=/opt/ndi-recorder/venv/bin/gunicorn \
-    -c /opt/ndi-recorder/gunicorn.conf.py \
+# Run gunicorn from the project's venv
+ExecStart=/home/ndi/ndi-recorder/venv/bin/gunicorn \
+    -c /home/ndi/ndi-recorder/gunicorn.conf.py \
     wsgi:app
 
-# Restart policy
-Restart=on-failure
-RestartSec=10
-StartLimitIntervalSec=60
-StartLimitBurst=3
+# Restart policy — come back up fast after crashes or code updates.
+# Restart=always covers graceful-shutdown rc=0 paths (e.g. OOM-killed child
+# propagating to the parent) that "on-failure" would otherwise ignore.
+Restart=always
+RestartSec=5
+# A transient DB/NDI outage at boot could easily chew through 5 restarts in
+# 60 s and then systemd stops trying — for a 24/7 recorder, be more forgiving.
+StartLimitIntervalSec=600
+StartLimitBurst=20
 
-# Logging — captured by journald
+# Logging — captured by journald (and optionally forwarded to syslog)
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ndi-recorder
@@ -32,6 +41,10 @@ SyslogIdentifier=ndi-recorder
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096
+# Cap memory so a runaway (e.g. upload stall with incoming frames buffering)
+# gets killed and restarted rather than taking the whole box down via OOM.
+MemoryMax=4G
+OOMScoreAdjust=-100
 
 # Security hardening
 NoNewPrivileges=yes

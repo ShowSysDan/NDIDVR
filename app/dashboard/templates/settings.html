@@ -15,7 +15,7 @@
     <div class="card" style="padding:0;overflow:hidden">
       <table>
         <thead>
-          <tr><th>Source</th><th>Quality</th><th>Enabled</th><th></th></tr>
+          <tr><th>Source</th><th>Quality</th><th>Audio</th><th>Enabled</th><th></th></tr>
         </thead>
         <tbody>
           {% for src in sources %}
@@ -34,6 +34,13 @@
               </select>
             </td>
             <td>
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer" title="Uncheck for silent feeds to save encoder cycles and disk space">
+                <input type="checkbox" {% if src.record_audio %}checked{% endif %}
+                       onchange="setAudio({{ src.id }}, this.checked)">
+                <span class="text-sm">{{ 'On' if src.record_audio else 'Off' }}</span>
+              </label>
+            </td>
+            <td>
               <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
                 <input type="checkbox" {% if src.enabled %}checked{% endif %}
                        onchange="setEnabled({{ src.id }}, this.checked)">
@@ -47,7 +54,7 @@
             </td>
           </tr>
           {% else %}
-          <tr><td colspan="4" style="text-align:center;padding:32px;color:var(--muted)">
+          <tr><td colspan="5" style="text-align:center;padding:32px;color:var(--muted)">
             No sources yet. <a href="#" onclick="scan()" style="color:var(--accent)">Scan the network.</a>
           </td></tr>
           {% endfor %}
@@ -59,8 +66,34 @@
     </div>
   </div>
 
-  <!-- Quality profiles info -->
+  <!-- Quality profiles info + retention -->
   <div>
+    <div class="card-title mb-8">Retention Policy</div>
+    <div class="card mb-16">
+      <p class="text-muted text-sm mb-8">
+        How long to keep originals before re-encoding, and how long to keep compressed copies.
+        Changes take effect on the next nightly run (or on the next manual trigger).
+      </p>
+      <div style="display:grid;grid-template-columns:1fr auto;gap:8px 12px;align-items:center">
+        <label for="ret-raw" class="text-sm">Keep raw (days)</label>
+        <input id="ret-raw" type="number" min="1" max="3650"
+               style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 8px;font-size:12px;width:90px">
+
+        <label for="ret-compressed" class="text-sm">Keep compressed (days; 0&nbsp;=&nbsp;forever)</label>
+        <input id="ret-compressed" type="number" min="0" max="36500"
+               style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 8px;font-size:12px;width:90px">
+
+        <label for="ret-hour" class="text-sm">Compression hour (UTC, 0–23)</label>
+        <input id="ret-hour" type="number" min="0" max="23"
+               style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:4px 8px;font-size:12px;width:90px">
+      </div>
+      <div style="margin-top:12px;display:flex;gap:8px">
+        <button class="btn btn-ghost" onclick="saveRetention()">Save</button>
+        <button class="btn btn-ghost" onclick="runRetention()">Run now</button>
+        <span id="ret-status" class="text-muted text-sm" style="align-self:center"></span>
+      </div>
+    </div>
+
     <div class="card-title mb-8">Quality Profiles</div>
     {% for k, v in profiles.items() %}
     <div class="card mb-8">
@@ -95,6 +128,12 @@ async function setEnabled(id, enabled) {
     body: JSON.stringify({enabled}),
   });
 }
+async function setAudio(id, on) {
+  await fetch(`/api/sources/${id}`, {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({record_audio: on}),
+  });
+}
 async function setName(id, name) {
   await fetch(`/api/sources/${id}`, {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
@@ -107,5 +146,41 @@ async function scan() {
   alert(`Found ${data.sources_found} source(s).`);
   location.reload();
 }
+
+async function loadRetention() {
+  try {
+    const r = await fetch('/api/system/retention');
+    const d = await r.json();
+    document.getElementById('ret-raw').value        = d.retention_raw_days;
+    document.getElementById('ret-compressed').value = d.retention_compressed_days;
+    document.getElementById('ret-hour').value       = d.compression_hour;
+  } catch (e) {
+    // leave inputs blank; the user can still save
+  }
+}
+async function saveRetention() {
+  const body = {
+    retention_raw_days:        parseInt(document.getElementById('ret-raw').value, 10),
+    retention_compressed_days: parseInt(document.getElementById('ret-compressed').value, 10),
+    compression_hour:          parseInt(document.getElementById('ret-hour').value, 10),
+  };
+  const s = document.getElementById('ret-status');
+  s.textContent = 'Saving…';
+  const r = await fetch('/api/system/retention', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  });
+  s.textContent = r.ok ? 'Saved.' : 'Save failed.';
+  setTimeout(() => s.textContent = '', 3000);
+}
+async function runRetention() {
+  const s = document.getElementById('ret-status');
+  s.textContent = 'Starting…';
+  const r = await fetch('/api/system/retention', {method:'POST'});
+  const d = await r.json().catch(() => ({}));
+  s.textContent = r.ok ? 'Running in background.' : (d.error || 'Failed to start.');
+  setTimeout(() => s.textContent = '', 5000);
+}
+loadRetention();
 </script>
 {% endblock %}

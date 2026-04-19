@@ -16,6 +16,34 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+log = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _apply_migrations(database_url: str) -> None:
+    """Run `alembic upgrade head` programmatically on startup.
+
+    Fresh databases pick up the full schema from the initial migration;
+    existing databases only apply newer revisions. Idempotent — safe to
+    call on every boot.
+    """
+    from alembic import command
+    from alembic.config import Config
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    alembic_ini = os.path.join(os.path.dirname(here), "alembic.ini")
+
+    cfg = Config(alembic_ini)
+    cfg.set_main_option("sqlalchemy.url", database_url)
+    cfg.set_main_option("script_location", os.path.join(os.path.dirname(here), "migrations"))
+    command.upgrade(cfg, "head")
+
 
 def create_app(test_config: dict | None = None):
     app = Flask(__name__, template_folder="dashboard/templates", static_folder="static")
@@ -45,9 +73,27 @@ def create_app(test_config: dict | None = None):
     app.config["RETENTION_COMPRESSED_DAYS"] = int(os.environ.get("RETENTION_COMPRESSED_DAYS", 365))
     app.config["COMPRESSION_SCHEDULE_HOUR"] = int(os.environ.get("COMPRESSION_SCHEDULE_HOUR", 2))
 
+    # Startup behaviour
+    app.config["START_IMMEDIATELY_ON_BOOT"] = _env_bool("START_IMMEDIATELY_ON_BOOT", True)
+    app.config["AUTO_MIGRATE_ON_STARTUP"]   = _env_bool("AUTO_MIGRATE_ON_STARTUP", True)
+    app.config["GAP_FILL_ON_DROP"]          = _env_bool("GAP_FILL_ON_DROP", True)
+
     # ── Test config override (applied before db.init_app) ────────────────────
     if test_config:
         app.config.update(test_config)
+
+    # ── Auto-migrate on startup ───────────────────────────────────────────────
+    # Runs alembic upgrade head so `git pull && systemctl restart ndi-recorder`
+    # picks up any schema changes with no manual step. Skipped in tests —
+    # conftest.py manages the test schema with db.create_all + savepoints.
+    migrations_applied = False
+    if app.config.get("AUTO_MIGRATE_ON_STARTUP") and not test_config:
+        try:
+            _apply_migrations(app.config["SQLALCHEMY_DATABASE_URI"])
+            log.info("Alembic migrations up to date")
+            migrations_applied = True
+        except Exception:
+            log.exception("Auto-migrate failed — will fall back to create_all")
 
     # ── Extensions ────────────────────────────────────────────────────────────
     from app.extensions import db, socketio, scheduler
@@ -56,10 +102,14 @@ def create_app(test_config: dict | None = None):
     async_mode = "threading" if test_config else "eventlet"
     socketio.init_app(app, async_mode=async_mode, cors_allowed_origins="*")
 
-    # ── DB tables ─────────────────────────────────────────────────────────────
-    with app.app_context():
-        from app.models import Source, Chunk  # noqa: F401
-        db.create_all()
+    # ── DB tables ────────────────────────────────────────────────────────────
+    # Tests: always create_all (isolated via savepoints in conftest).
+    # Production: only create_all when alembic didn't run (disabled or failed)
+    # so a fresh DB still comes up.
+    if test_config or not migrations_applied:
+        with app.app_context():
+            from app.models import Source, Chunk  # noqa: F401
+            db.create_all()
 
     # ── S3 uploader ───────────────────────────────────────────────────────────
     from app.recorder.uploader import uploader
@@ -159,7 +209,16 @@ def create_app(test_config: dict | None = None):
     # ── Start recording after everything is ready ─────────────────────────────
     with app.app_context():
         manager.scan_sources()
-        manager.start_all_enabled()
+        if app.config.get("START_IMMEDIATELY_ON_BOOT", True):
+            # Default: begin recording the instant the service comes up.
+            # The next chunk rotation will still happen at :00/:30.
+            log.info("START_IMMEDIATELY_ON_BOOT=true — starting recording now")
+            manager.start_all_enabled()
+        else:
+            log.info(
+                "START_IMMEDIATELY_ON_BOOT=false — first chunk will begin "
+                "at the next :00/:30 boundary"
+            )
         manager.start_watchdog()
 
     return app

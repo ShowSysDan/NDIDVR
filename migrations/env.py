@@ -28,7 +28,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.extensions import db
-from app.models import Source, Chunk  # noqa: F401 — ensure models are imported
+from app.models import Source, Chunk, Setting  # noqa: F401 — ensure models are imported
 target_metadata = db.metadata
 
 

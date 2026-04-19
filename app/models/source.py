@@ -10,6 +10,9 @@ class Source(db.Model):
     display_name = db.Column(db.String(255), nullable=True)
     enabled = db.Column(db.Boolean, default=True, nullable=False)
     quality = db.Column(db.String(32), default="archive", nullable=False)
+    # Most NDI feeds in this deployment are video-only; capturing audio
+    # costs encoder cycles + file size, so it's per-source opt-in.
+    record_audio = db.Column(db.Boolean, default=True, nullable=False)
     first_seen = db.Column(db.DateTime, default=datetime.utcnow)
     last_seen = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -27,6 +30,7 @@ class Source(db.Model):
             "label": self.label,
             "enabled": self.enabled,
             "quality": self.quality,
+            "record_audio": self.record_audio,
             "first_seen": self.first_seen.isoformat() if self.first_seen else None,
             "last_seen": self.last_seen.isoformat() if self.last_seen else None,
         }

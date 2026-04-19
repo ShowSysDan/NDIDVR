@@ -29,7 +29,11 @@ _WATCHDOG_INTERVAL = 10  # watchdog wakes every N seconds
 
 class _SourceState:
     """Runtime state for one NDI source."""
-    __slots__ = ("source_id", "ndi_name", "recorder", "backoff", "retry_after", "disabled")
+    __slots__ = (
+        "source_id", "ndi_name", "recorder",
+        "backoff", "retry_after", "disabled",
+        "quality",  # cached so live_status doesn't hit the DB per source, per tick
+    )
 
     def __init__(self, source_id: int, ndi_name: str):
         self.source_id   = source_id
@@ -38,6 +42,7 @@ class _SourceState:
         self.backoff     = _BACKOFF_BASE
         self.retry_after: float = 0      # monotonic; 0 = try immediately
         self.disabled    = False
+        self.quality     = DEFAULT_QUALITY
 
 
 class RecorderManager:
@@ -224,7 +229,7 @@ class RecorderManager:
                     rec.current_chunk_start.isoformat()
                     if rec and rec.current_chunk_start else None
                 ),
-                "quality":    self._db_quality(sid),
+                "quality":    state.quality,
                 "resolution": f"{rec._width}x{rec._height}" if rec and rec._width else "—",
                 "fps":        f"{rec._fps_n}/{rec._fps_d}" if rec else "—",
             })
@@ -244,12 +249,17 @@ class RecorderManager:
             src = Source.query.get(source_id)
             if not src or not src.enabled:
                 return
-            quality_key = src.quality
-            ndi_name    = src.ndi_name
+            quality_key  = src.quality
+            ndi_name     = src.ndi_name
+            record_audio = bool(src.record_audio)
 
         from app.recorder.source_recorder import SourceRecorder
-        quality  = QUALITY_PROFILES.get(quality_key, QUALITY_PROFILES[DEFAULT_QUALITY])
-        rec      = SourceRecorder(ndi_name, source_id, quality, self._buffer_dir)
+        quality   = QUALITY_PROFILES.get(quality_key, QUALITY_PROFILES[DEFAULT_QUALITY])
+        gap_fill  = bool(self._app.config.get("GAP_FILL_ON_DROP", True))
+        rec       = SourceRecorder(
+            ndi_name, source_id, quality, self._buffer_dir,
+            gap_fill=gap_fill, record_audio=record_audio,
+        )
         path     = self._chunk_path(source_id, ndi_name, quality_key)
         ok       = rec.start_chunk(path)
 
@@ -258,6 +268,7 @@ class RecorderManager:
                 state = self._states.get(source_id)
                 if state:
                     state.recorder = rec
+                    state.quality  = quality_key
             self._create_chunk_db(source_id, path, quality_key)
             log.info("Recording started: source %d (%s)", source_id, ndi_name)
         else:
@@ -283,15 +294,21 @@ class RecorderManager:
                         s.recorder = None
                         s.disabled = not (src and src.enabled)
                 return
-            quality_key = src.quality
-            ndi_name    = src.ndi_name
+            quality_key  = src.quality
+            ndi_name     = src.ndi_name
+            record_audio = bool(src.record_audio)
 
         quality = QUALITY_PROFILES.get(quality_key, QUALITY_PROFILES[DEFAULT_QUALITY])
         rec.quality = quality
+        rec.record_audio = record_audio
         path = self._chunk_path(source_id, ndi_name, quality_key)
         ok   = rec.start_chunk(path)
 
         if ok:
+            with self._lock:
+                s = self._states.get(source_id)
+                if s:
+                    s.quality = quality_key
             self._create_chunk_db(source_id, path, quality_key)
         else:
             log.error("Rotation failed for source %d — watchdog will retry", source_id)
@@ -307,8 +324,15 @@ class RecorderManager:
             log.warning("Error stopping stale recorder: %s", exc)
 
     def _chunk_path(self, source_id: int, ndi_name: str, quality: str) -> str:
-        safe = (ndi_name.replace(" ", "_").replace("/", "-")
-                        .replace("(", "").replace(")", ""))
+        # NDI source names come from the LAN and can contain anything (control
+        # chars, path separators, leading dashes that FFmpeg mistakes for flags).
+        # Whitelist: letters, digits, underscore, dot, dash. Strip leading dots
+        # and dashes so the filename is never mistaken for an FFmpeg option.
+        import re
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", ndi_name).lstrip("-.").strip("_")
+        if not safe:
+            safe = f"source_{source_id}"
+        safe = safe[:80]  # keep path length sane
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         return os.path.join(self._buffer_dir, f"{safe}_{ts}_{quality}.mp4")
 
