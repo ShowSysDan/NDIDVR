@@ -59,7 +59,7 @@ def update_source(source_id):
         else:
             manager.disable_source(source_id)
     if "quality" in data:
-        from config.quality import QUALITY_PROFILES
+        from app.quality_profiles import QUALITY_PROFILES
         if data["quality"] not in QUALITY_PROFILES:
             return jsonify({"error": "Invalid quality profile"}), 400
         src.quality = data["quality"]
@@ -67,9 +67,54 @@ def update_source(source_id):
     if "record_audio" in data:
         # Takes effect on next rotation (the recorder picks it up in _rotate)
         src.record_audio = bool(data["record_audio"])
+    if "timelapse_interval_seconds" in data:
+        try:
+            v = int(data["timelapse_interval_seconds"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "timelapse_interval_seconds must be an integer"}), 400
+        if v < 0 or v > 86400:
+            return jsonify({"error": "timelapse_interval_seconds out of range (0..86400)"}), 400
+        src.timelapse_interval_seconds = v
+        # Picked up on next rotation; the current chunk finishes with the
+        # previous setting to avoid abrupt filesystem churn mid-recording.
 
     db.session.commit()
     return jsonify(src.to_dict())
+
+
+@sources_bp.get("/<int:source_id>/preview.jpg")
+def source_preview(source_id):
+    """Return the latest decoded video frame from a recording source as JPEG.
+
+    Used by the dashboard to show a live thumbnail. Encoded on-demand from
+    the frame already cached for gap-fill, so no extra frame work runs
+    until the first request.
+    """
+    from flask import abort, request as _req
+    from app.recorder.manager import manager
+
+    state = manager._states.get(source_id)
+    rec = state.recorder if state else None
+    if not rec:
+        abort(404)
+
+    try:
+        max_w = min(int(_req.args.get("w", 640)), 1920)
+    except (TypeError, ValueError):
+        max_w = 640
+    try:
+        quality = max(30, min(int(_req.args.get("q", 70)), 95))
+    except (TypeError, ValueError):
+        quality = 70
+
+    jpeg = rec.get_preview_jpeg(max_width=max_w, quality=quality)
+    if not jpeg:
+        abort(404)
+    return Response(
+        jpeg,
+        mimetype="image/jpeg",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @sources_bp.post("/scan")
@@ -77,25 +122,6 @@ def scan_sources():
     from app.recorder.manager import manager
     found = manager.scan_sources()
     return jsonify({"sources_found": len(found), "sources": found})
-
-
-@sources_bp.post("/<int:source_id>/quality")
-def set_quality(source_id):
-    from app.extensions import db
-    from app.models.source import Source
-    from app.recorder.manager import manager
-    from config.quality import QUALITY_PROFILES
-
-    data = request.get_json(force=True)
-    quality = data.get("quality")
-    if quality not in QUALITY_PROFILES:
-        return jsonify({"error": f"Unknown quality '{quality}'"}), 400
-
-    src = Source.query.get_or_404(source_id)
-    src.quality = quality
-    db.session.commit()
-    manager.set_quality(source_id, quality)
-    return jsonify({"source_id": source_id, "quality": quality, "note": "Takes effect on next chunk rotation"})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -223,6 +249,7 @@ system_bp = Blueprint("system", __name__, url_prefix="/api/system")
 @system_bp.get("/health")
 def health():
     import psutil
+    from app import __version__
     from app.recorder.manager import manager
     from app.recorder.uploader import uploader
 
@@ -231,6 +258,7 @@ def health():
 
     return jsonify({
         "status":               "ok",
+        "version":              __version__,
         "cpu_percent":          psutil.cpu_percent(),
         "mem_percent":          mem.percent,
         "mem_used_gb":          round(mem.used  / 1024**3, 2),

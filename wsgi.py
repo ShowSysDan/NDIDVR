@@ -1,10 +1,6 @@
-"""
-WSGI / development entry point.
+"""Gunicorn WSGI entry point.
 
-Development:
-    python wsgi.py
-
-Production (gunicorn + eventlet):
+Production:
     gunicorn -c gunicorn.conf.py wsgi:app
 """
 
@@ -25,11 +21,5 @@ configure_logging(
 )
 
 from app import create_app
-from app.extensions import socketio
 
 app = create_app()
-
-if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host=host, port=port, debug=False, use_reloader=False)

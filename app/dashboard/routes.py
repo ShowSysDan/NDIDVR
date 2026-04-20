@@ -6,8 +6,12 @@ dashboard_bp = Blueprint("dashboard", __name__, url_prefix="/")
 
 @dashboard_bp.app_context_processor
 def inject_globals():
-    """Make today's date available in every template."""
-    return {"today": datetime.utcnow().strftime("%Y-%m-%d")}
+    """Make today's date and app version available in every template."""
+    from app import __version__
+    return {
+        "today": datetime.utcnow().strftime("%Y-%m-%d"),
+        "app_version": __version__,
+    }
 
 
 @dashboard_bp.get("/")
@@ -143,6 +147,6 @@ def storage():
 @dashboard_bp.get("/settings")
 def settings():
     from app.models.source import Source
-    from config.quality import QUALITY_PROFILES
+    from app.quality_profiles import QUALITY_PROFILES
     sources = Source.query.order_by(Source.display_name).all()
     return render_template("settings.html", sources=sources, profiles=QUALITY_PROFILES)

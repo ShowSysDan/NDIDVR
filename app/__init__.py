@@ -8,6 +8,8 @@ import os
 from dotenv import load_dotenv
 from flask import Flask
 
+__version__ = "0.4.0"
+
 load_dotenv()
 
 logging.basicConfig(
@@ -67,6 +69,7 @@ def create_app(test_config: dict | None = None):
     app.config["CHUNK_DURATION_MINUTES"] = int(os.environ.get("CHUNK_DURATION_MINUTES", 30))
     app.config["NDI_DISCOVERY_TIMEOUT_MS"] = int(os.environ.get("NDI_DISCOVERY_TIMEOUT_MS", 5000))
     app.config["NDI_RESCAN_INTERVAL_SECONDS"] = int(os.environ.get("NDI_RESCAN_INTERVAL_SECONDS", 30))
+    app.config["TIMELAPSE_DIR"] = os.environ.get("TIMELAPSE_DIR", "/tmp/ndi_timelapse")
 
     # Retention
     app.config["RETENTION_RAW_DAYS"] = int(os.environ.get("RETENTION_RAW_DAYS", 7))
@@ -139,16 +142,11 @@ def create_app(test_config: dict | None = None):
     def server_error(e):
         return rt("500.html"), 500
 
-    # ── Flask CLI commands ────────────────────────────────────────────────────
+    # ── Flask CLI: `flask --app wsgi:app scan` ────────────────────────────────
+    # Useful on a fresh install to confirm the box sees NDI sources before
+    # anything is enabled in the UI. Everything else is exposed via the
+    # dashboard/API so no other CLI commands are needed.
     import click
-
-    @app.cli.command("init-db")
-    def init_db_cmd():
-        """Create all database tables."""
-        with app.app_context():
-            from app.models import Source, Chunk  # noqa
-            db.create_all()
-        click.echo("Database tables created.")
 
     @app.cli.command("scan")
     def scan_cmd():
@@ -160,35 +158,6 @@ def create_app(test_config: dict | None = None):
                 click.echo("No NDI sources found.")
             for s in sources:
                 click.echo(f"  {s['ndi_name']}")
-
-    @app.cli.command("retention")
-    def retention_cmd():
-        """Run the retention/compression job immediately."""
-        with app.app_context():
-            from app.recorder.retention import run_retention
-            click.echo("Running retention job…")
-            run_retention(app)
-            click.echo("Done.")
-
-    @app.cli.command("list-chunks")
-    @click.option("--source", default=None, help="Filter by NDI source name")
-    @click.option("--limit", default=20, help="Max rows")
-    def list_chunks_cmd(source, limit):
-        """List recent recording chunks from the database."""
-        with app.app_context():
-            from app.models.chunk import Chunk
-            from app.models.source import Source
-            q = Chunk.query.order_by(Chunk.started_at.desc())
-            if source:
-                src = Source.query.filter(Source.ndi_name.ilike(f"%{source}%")).first()
-                if src:
-                    q = q.filter_by(source_id=src.id)
-            chunks = q.limit(limit).all()
-            for c in chunks:
-                click.echo(
-                    f"  [{c.id:4d}] {c.started_at}  {c.quality:10s}  "
-                    f"{c.size_human:10s}  {c.upload_status:10s}  {c.s3_key or '(local)'}"
-                )
 
     # ── Scheduler ─────────────────────────────────────────────────────────────
     from app.recorder.scheduler import register_jobs
