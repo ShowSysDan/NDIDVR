@@ -150,3 +150,32 @@ def settings():
     from app.quality_profiles import QUALITY_PROFILES
     sources = Source.query.order_by(Source.display_name).all()
     return render_template("settings.html", sources=sources, profiles=QUALITY_PROFILES)
+
+
+@dashboard_bp.get("/watch")
+def watch():
+    """DVR-style player. Sources, initial selection, and start time come from
+    the query string so the page itself is a thin shell — all the data is
+    fetched client-side from the timeline/markers/clips APIs.
+    """
+    from app.models.source import Source
+    sources = Source.query.order_by(Source.display_name, Source.ndi_name).all()
+
+    requested_ids: list[int] = []
+    raw = request.args.get("sources") or request.args.get("source_id") or ""
+    for token in raw.split(","):
+        token = token.strip()
+        if token.isdigit():
+            requested_ids.append(int(token))
+    if not requested_ids and sources:
+        requested_ids = [sources[0].id]
+    requested_ids = requested_ids[:4]
+
+    initial_t = request.args.get("t", "")
+
+    return render_template(
+        "watch.html",
+        sources=sources,
+        initial_ids=requested_ids,
+        initial_t=initial_t,
+    )

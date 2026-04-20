@@ -8,7 +8,7 @@ import os
 from dotenv import load_dotenv
 from flask import Flask
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 load_dotenv()
 
@@ -70,6 +70,7 @@ def create_app(test_config: dict | None = None):
     app.config["NDI_DISCOVERY_TIMEOUT_MS"] = int(os.environ.get("NDI_DISCOVERY_TIMEOUT_MS", 5000))
     app.config["NDI_RESCAN_INTERVAL_SECONDS"] = int(os.environ.get("NDI_RESCAN_INTERVAL_SECONDS", 30))
     app.config["TIMELAPSE_DIR"] = os.environ.get("TIMELAPSE_DIR", "/tmp/ndi_timelapse")
+    app.config["CLIP_EXPORT_DIR"] = os.environ.get("CLIP_EXPORT_DIR", "/tmp/ndi_clips")
 
     # Retention
     app.config["RETENTION_RAW_DAYS"] = int(os.environ.get("RETENTION_RAW_DAYS", 7))
@@ -111,22 +112,34 @@ def create_app(test_config: dict | None = None):
     # so a fresh DB still comes up.
     if test_config or not migrations_applied:
         with app.app_context():
-            from app.models import Source, Chunk  # noqa: F401
+            from app.models import Source, Chunk, Setting, Marker, Clip  # noqa: F401
             db.create_all()
 
     # ── S3 uploader ───────────────────────────────────────────────────────────
     from app.recorder.uploader import uploader
     uploader.init_app(app)
 
+    # ── Clip exporter ─────────────────────────────────────────────────────────
+    # Serialized ffmpeg worker niced below the live recorders, so DVR clip
+    # exports never steal CPU from the recording pipeline.
+    from app.recorder.clip_exporter import clip_exporter
+    clip_exporter.init_app(app)
+
     # ── Recorder manager ──────────────────────────────────────────────────────
     from app.recorder.manager import manager
     manager.init_app(app)
 
     # ── Blueprints ────────────────────────────────────────────────────────────
-    from app.api import sources_bp, recordings_bp, system_bp
+    from app.api import (
+        sources_bp, recordings_bp, system_bp,
+        timeline_bp, markers_bp, clips_bp,
+    )
     app.register_blueprint(sources_bp)
     app.register_blueprint(recordings_bp)
     app.register_blueprint(system_bp)
+    app.register_blueprint(timeline_bp)
+    app.register_blueprint(markers_bp)
+    app.register_blueprint(clips_bp)
 
     from app.dashboard.routes import dashboard_bp
     app.register_blueprint(dashboard_bp)

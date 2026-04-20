@@ -6,11 +6,32 @@ S3 content is always proxied through Flask; no presigned URLs exposed.
 import logging
 import mimetypes
 import os
+import re
 from datetime import datetime
 
 from flask import Blueprint, Response, jsonify, request, stream_with_context
 
 log = logging.getLogger(__name__)
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 timestamp ('Z' or naive) into a naive UTC datetime.
+
+    The whole app stores naive UTC in the DB (started_at, ended_at, etc.),
+    so we normalize any incoming timestamp to that shape.
+    """
+    if not value:
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(tz=None).replace(tzinfo=None)
+    return dt
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Sources
@@ -194,7 +215,7 @@ def download_chunk(chunk_id):
     if not s3_key:
         # Fall back to local buffer if still uploading
         if chunk.local_path and os.path.exists(chunk.local_path):
-            return _serve_local(chunk)
+            return _serve_local(chunk, as_attachment=True)
         return jsonify({"error": "File not available"}), 404
 
     filename = chunk.filename
@@ -219,7 +240,78 @@ def download_chunk(chunk_id):
         return jsonify({"error": "Download failed"}), 500
 
 
-def _serve_local(chunk):
+@recordings_bp.get("/<int:chunk_id>/stream")
+def stream_chunk(chunk_id):
+    """Range-aware MP4 stream for the DVR watch page.
+
+    The HTML5 <video> element issues `Range: bytes=...` every time it
+    seeks. We honour those by passing the same range through to S3, so a
+    scrub never pulls a whole 30-minute chunk.
+
+    Live recording is untouched by this path: it's a read-only S3 GET
+    (or read-only local-buffer read for a chunk that hasn't uploaded
+    yet) — no contention with the recorder or uploader threads.
+    """
+    from app.models.chunk import Chunk
+    from app.recorder.uploader import uploader
+
+    chunk = Chunk.query.get_or_404(chunk_id)
+    s3_key = chunk.compressed_s3_key or chunk.s3_key
+
+    # Still buffering? send_file honours Range when conditional=True.
+    if not s3_key:
+        if chunk.local_path and os.path.exists(chunk.local_path):
+            return _serve_local(chunk, as_attachment=False)
+        return jsonify({"error": "File not available"}), 404
+
+    total = uploader.get_object_size(s3_key)
+    if total is None:
+        return jsonify({"error": "File not available"}), 404
+
+    range_header = request.headers.get("Range")
+    if not range_header:
+        return Response(
+            stream_with_context(uploader.stream_to_response(s3_key)),
+            mimetype="video/mp4",
+            headers={
+                "Content-Length": str(total),
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "private, max-age=3600",
+            },
+            direct_passthrough=True,
+        )
+
+    m = re.match(r"bytes=(\d*)-(\d*)", range_header)
+    if not m:
+        return Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+    start_s, end_s = m.group(1), m.group(2)
+    if start_s == "":
+        # Suffix range: "bytes=-500" = last 500 bytes
+        suffix = int(end_s or 0)
+        start = max(0, total - suffix)
+        end = total - 1
+    else:
+        start = int(start_s)
+        end = int(end_s) if end_s else total - 1
+    if start >= total or end >= total or start > end:
+        return Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+
+    length = end - start + 1
+    return Response(
+        stream_with_context(uploader.stream_range(s3_key, start, end)),
+        status=206,
+        mimetype="video/mp4",
+        headers={
+            "Content-Range":  f"bytes {start}-{end}/{total}",
+            "Accept-Ranges":  "bytes",
+            "Content-Length": str(length),
+            "Cache-Control":  "private, max-age=3600",
+        },
+        direct_passthrough=True,
+    )
+
+
+def _serve_local(chunk, as_attachment: bool):
     """Serve from local buffer (chunk still uploading).
 
     Validate that the path lives inside the configured buffer dir before
@@ -234,9 +326,10 @@ def _serve_local(chunk):
         abort(404)
     return send_file(
         target,
-        as_attachment=True,
+        as_attachment=as_attachment,
         download_name=chunk.filename,
         mimetype="video/mp4",
+        conditional=True,  # enables Range support
     )
 
 
@@ -408,3 +501,266 @@ def queue_status():
         "queue_depth":  uploader._queue.qsize(),
         "pending":      [c.to_dict() for c in pending],
     })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Timeline — feeds the DVR watch page with chunks + markers for a window
+# ──────────────────────────────────────────────────────────────────────────────
+timeline_bp = Blueprint("timeline", __name__, url_prefix="/api/timeline")
+
+
+@timeline_bp.get("/")
+def get_timeline():
+    """Return every chunk (and every marker) that overlaps [start, end]
+    for one source, in chronological order.
+
+    Query params:
+      source_id  — int, required
+      start      — ISO-8601 UTC
+      end        — ISO-8601 UTC (must be > start, max 7 days from start)
+    """
+    from app.models.chunk import Chunk
+    from app.models.marker import Marker
+    from app.models.source import Source
+
+    source_id = request.args.get("source_id", type=int)
+    if not source_id:
+        return jsonify({"error": "source_id required"}), 400
+    src = Source.query.get(source_id)
+    if not src:
+        return jsonify({"error": "Unknown source_id"}), 404
+
+    start = _parse_iso(request.args.get("start"))
+    end   = _parse_iso(request.args.get("end"))
+    if not start or not end or end <= start:
+        return jsonify({"error": "Invalid start/end"}), 400
+    # Cap window to 7 days so the JSON stays small and the query cheap
+    if (end - start).total_seconds() > 7 * 86400:
+        return jsonify({"error": "Window too large (max 7 days)"}), 400
+
+    chunks = (
+        Chunk.query
+        .filter(
+            Chunk.source_id == source_id,
+            # Overlap: chunk.ended_at > start AND chunk.started_at < end
+            # For chunks that have no ended_at yet (actively recording),
+            # treat ended_at as "now" by using started_at + 1 hour as a proxy.
+            Chunk.started_at < end,
+        )
+        .order_by(Chunk.started_at)
+        .all()
+    )
+    # Filter out the trailing-end case in Python because some chunks
+    # won't have ended_at set yet (currently-recording chunk).
+    overlapping = []
+    for c in chunks:
+        c_end = c.ended_at or datetime.utcnow()
+        if c_end > start:
+            overlapping.append(c)
+
+    markers = (
+        Marker.query
+        .filter(
+            Marker.source_id == source_id,
+            Marker.timestamp_utc >= start,
+            Marker.timestamp_utc <= end,
+        )
+        .order_by(Marker.timestamp_utc)
+        .all()
+    )
+
+    def chunk_view(c):
+        d = c.to_dict()
+        d["stream_url"] = f"/api/recordings/{c.id}/stream"
+        d["available"] = bool(
+            c.s3_key or c.compressed_s3_key or (c.local_path and os.path.exists(c.local_path))
+        )
+        # Wall-clock end for chunks still recording
+        d["effective_ended_at"] = (c.ended_at or datetime.utcnow()).isoformat()
+        return d
+
+    return jsonify({
+        "source":  src.to_dict(),
+        "start":   start.isoformat(),
+        "end":     end.isoformat(),
+        "chunks":  [chunk_view(c) for c in overlapping],
+        "markers": [m.to_dict() for m in markers],
+    })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Markers
+# ──────────────────────────────────────────────────────────────────────────────
+markers_bp = Blueprint("markers", __name__, url_prefix="/api/markers")
+
+
+@markers_bp.get("/")
+def list_markers():
+    from app.models.marker import Marker
+
+    q = Marker.query
+    source_id = request.args.get("source_id", type=int)
+    if source_id:
+        q = q.filter_by(source_id=source_id)
+    start = _parse_iso(request.args.get("start"))
+    end   = _parse_iso(request.args.get("end"))
+    if start:
+        q = q.filter(Marker.timestamp_utc >= start)
+    if end:
+        q = q.filter(Marker.timestamp_utc <= end)
+    q = q.order_by(Marker.timestamp_utc).limit(1000)
+    return jsonify({"markers": [m.to_dict() for m in q.all()]})
+
+
+@markers_bp.post("/")
+def create_marker():
+    from app.extensions import db
+    from app.models.marker import Marker
+    from app.models.source import Source
+
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        source_id = int(data["source_id"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "source_id required"}), 400
+    ts = _parse_iso(data.get("timestamp_utc"))
+    if not ts:
+        return jsonify({"error": "timestamp_utc required (ISO-8601)"}), 400
+    if not Source.query.get(source_id):
+        return jsonify({"error": "Unknown source_id"}), 404
+
+    label = (data.get("label") or "").strip()[:255]
+    color = (data.get("color") or "#22c55e").strip()[:16]
+    if not re.fullmatch(r"#[0-9a-fA-F]{3,8}", color):
+        color = "#22c55e"
+
+    m = Marker(source_id=source_id, timestamp_utc=ts, label=label, color=color)
+    db.session.add(m)
+    db.session.commit()
+    return jsonify(m.to_dict()), 201
+
+
+@markers_bp.delete("/<int:marker_id>")
+def delete_marker(marker_id):
+    from app.extensions import db
+    from app.models.marker import Marker
+    m = Marker.query.get_or_404(marker_id)
+    db.session.delete(m)
+    db.session.commit()
+    return jsonify({"deleted": marker_id})
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clip export
+# ──────────────────────────────────────────────────────────────────────────────
+clips_bp = Blueprint("clips", __name__, url_prefix="/api/clips")
+
+
+@clips_bp.get("/")
+def list_clips():
+    from app.models.clip import Clip
+    page = request.args.get("page", 1, type=int)
+    per_page = max(1, min(request.args.get("per_page", 50, type=int), 200))
+    pagination = (
+        Clip.query.order_by(Clip.created_at.desc())
+        .paginate(page=page, per_page=per_page, error_out=False)
+    )
+    return jsonify({
+        "clips":    [c.to_dict() for c in pagination.items],
+        "total":    pagination.total,
+        "page":     page,
+        "pages":    pagination.pages,
+        "per_page": per_page,
+    })
+
+
+@clips_bp.post("/")
+def create_clip():
+    from app.extensions import db
+    from app.models.clip import Clip
+    from app.models.source import Source
+    from app.recorder.clip_exporter import clip_exporter
+
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        source_id = int(data["source_id"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "source_id required"}), 400
+    if not Source.query.get(source_id):
+        return jsonify({"error": "Unknown source_id"}), 404
+
+    start = _parse_iso(data.get("start_utc"))
+    end   = _parse_iso(data.get("end_utc"))
+    if not start or not end or end <= start:
+        return jsonify({"error": "Invalid start_utc/end_utc"}), 400
+    # Cap at 6 hours so the concat worker can't be tied up for days
+    if (end - start).total_seconds() > 6 * 3600:
+        return jsonify({"error": "Clip too long (max 6 hours)"}), 400
+
+    label = (data.get("label") or "").strip()[:255]
+
+    clip = Clip(
+        source_id=source_id, label=label,
+        start_utc=start, end_utc=end,
+        status="queued", progress=0,
+    )
+    db.session.add(clip)
+    db.session.commit()
+
+    clip_exporter.enqueue(clip.id)
+    return jsonify(clip.to_dict()), 202
+
+
+@clips_bp.get("/<int:clip_id>")
+def get_clip(clip_id):
+    from app.models.clip import Clip
+    from app.recorder.clip_exporter import clip_exporter
+    c = Clip.query.get_or_404(clip_id)
+    d = c.to_dict()
+    d["queue_depth"] = clip_exporter.queue_depth()
+    return jsonify(d)
+
+
+@clips_bp.get("/<int:clip_id>/download")
+def download_clip(clip_id):
+    from flask import abort, current_app, send_file
+    from app.models.clip import Clip
+    c = Clip.query.get_or_404(clip_id)
+    if c.status != "done" or not c.output_path:
+        return jsonify({"error": "Clip not ready", "status": c.status}), 409
+
+    # Path containment check — the DB column is written by the worker but
+    # defence in depth against anyone slipping a row in.
+    export_dir = os.path.realpath(current_app.config.get("CLIP_EXPORT_DIR", "/tmp/ndi_clips"))
+    target = os.path.realpath(c.output_path)
+    if not target.startswith(export_dir + os.sep):
+        log.error("Clip %d output_path outside export dir: %s", c.id, c.output_path)
+        abort(404)
+    if not os.path.exists(target):
+        return jsonify({"error": "Output file missing"}), 410
+
+    return send_file(
+        target,
+        as_attachment=True,
+        download_name=os.path.basename(target),
+        mimetype="video/mp4",
+        conditional=True,
+    )
+
+
+@clips_bp.delete("/<int:clip_id>")
+def delete_clip(clip_id):
+    from app.extensions import db
+    from app.models.clip import Clip
+    c = Clip.query.get_or_404(clip_id)
+    # Only allow deleting terminal clips so we don't interrupt a running export
+    if c.status == "running":
+        return jsonify({"error": "Clip is currently being exported"}), 409
+    if c.output_path and os.path.exists(c.output_path):
+        try:
+            os.remove(c.output_path)
+        except OSError as exc:
+            log.warning("Could not remove clip output %s: %s", c.output_path, exc)
+    db.session.delete(c)
+    db.session.commit()
+    return jsonify({"deleted": clip_id})
