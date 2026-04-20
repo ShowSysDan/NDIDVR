@@ -141,6 +141,34 @@ class S3Uploader:
             log.error("S3 stream error key=%s: %s", s3_key, exc)
             raise
 
+    def stream_range(self, s3_key: str, start: int, end: int):
+        """
+        Generator: streams a byte range [start, end] (inclusive) from S3.
+        Used by the DVR watch page so HTML5 <video> scrubbing works over
+        the Flask proxy without pulling the whole chunk on every seek.
+        """
+        try:
+            obj = self._client.get_object(
+                Bucket=self._bucket,
+                Key=s3_key,
+                Range=f"bytes={start}-{end}",
+            )
+            body = obj["Body"]
+            while True:
+                chunk = body.read(STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                yield chunk
+        except ClientError as exc:
+            log.error("S3 range stream error key=%s range=%d-%d: %s",
+                      s3_key, start, end, exc)
+            raise
+
+    def download_to_file(self, s3_key: str, dest_path: str) -> None:
+        """Download an S3 object to a local path (used by the clip exporter)."""
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        self._client.download_file(self._bucket, s3_key, dest_path)
+
     def get_object_meta(self, s3_key: str) -> dict | None:
         """Return {size, content_type} for a key, or None if missing."""
         try:

@@ -1,8 +1,8 @@
 # NDI Recorder
 
-> Version 0.4.0
+> Version 0.5.0
 
-A Python/Flask web application for continuous multi-source NDI recording with S3-compatible storage, PostgreSQL metadata, scheduled 30-minute chunking, tiered quality profiles, per-source live previews, optional timelapse stills, and a real-time system health dashboard.
+A Python/Flask web application for continuous multi-source NDI recording with S3-compatible storage, PostgreSQL metadata, scheduled 30-minute chunking, tiered quality profiles, per-source live previews, optional timelapse stills, a DVR-style watch page (scrub, variable-speed playback, markers, multi-view, clip export), and a real-time system health dashboard.
 
 ---
 
@@ -94,6 +94,9 @@ All source metadata, recording sessions, chunk manifests, and settings live in P
 - **Two quality tiers** — archive quality (24/7 default) and full quality (on-demand per source)
 - **Live JPEG previews** — every active source exposes `/api/sources/<id>/preview.jpg`; the Settings page auto-refreshes thumbnails every 3 s at zero extra capture cost
 - **Timelapse stills** — set a per-source interval in the Settings page and the recorder writes timestamped JPEGs to `TIMELAPSE_DIR/<source>/` (filename format `name_YYYYMMDD_HHMMSSZ.jpg`)
+- **DVR watch page** (`/watch`) — scrub a timeline stitched from 30-min chunks with ½× / 1× / 2× / 5× / 10× forward + reverse playback (reverse is stepped-seek), add markers, drag an in/out range, and queue an MP4 clip export. Up to 4 sources can be synced in a quad view off one master clock.
+- **Clip export worker** — ffmpeg concat+trim runs serialized and `nice`d below the recorder ffmpegs, so exports never steal CPU from live capture. Status + progress are polled live on the Watch page.
+- **Range-aware MP4 proxy** — `GET /api/recordings/<id>/stream` honours `Range` requests end-to-end against SeaweedFS/S3 so `<video>` scrubbing never pulls a whole 30-minute chunk on a seek.
 - **Per-source audio toggle** — disable encoding for silent feeds to save CPU + disk
 - **Retention UI** — edit raw-days, compressed-days, and nightly hour from the Settings page; kick off an ad-hoc retention pass with one click
 - **S3-first storage** — local disk is buffer only; chunks upload to S3 on completion and are removed locally after confirmation
@@ -269,6 +272,7 @@ CHUNK_DURATION_MINUTES=30
 NDI_DISCOVERY_TIMEOUT_MS=5000
 NDI_RESCAN_INTERVAL_SECONDS=30
 TIMELAPSE_DIR=/var/ndi-recorder/timelapse         # where per-source JPEG stills are written
+CLIP_EXPORT_DIR=/var/ndi-recorder/clips           # DVR clip export output directory
 START_IMMEDIATELY_ON_BOOT=true
 GAP_FILL_ON_DROP=true
 AUTO_MIGRATE_ON_STARTUP=true
@@ -507,6 +511,7 @@ The Flask web dashboard runs at `http://<host>:5000`.
 | `/` | Overview — discovered sources, live status, CPU/memory, current chunks |
 | `/browse` | Chunk browser with date/source filters |
 | `/storage` | S3 usage totals per source and per day |
+| `/watch` | DVR-style playback: scrub a timeline, variable-speed + reverse, markers, quad multi-view, in/out range clip export. Recording continues in the background. |
 | `/settings` | Source management (rename, enable/disable, quality profile, audio on/off, timelapse interval) + live previews + retention policy editor |
 
 The UI is themed to match the [WebRetriever2](https://github.com/ShowSysDan/WebRetriever2) dark broadcasting palette: near-black surfaces, neon green active state, Outfit + JetBrains Mono typography.
@@ -526,6 +531,21 @@ All endpoints return JSON.
 | `PATCH` | `/api/sources/{id}` | Update source settings (`display_name`, `enabled`, `quality`, `record_audio`, `timelapse_interval_seconds`) |
 | `GET` | `/api/sources/{id}/preview.jpg` | Latest frame as JPEG (query params: `w` max width in px, `q` quality 30-95). Returns 404 when the source isn't actively recording. |
 | `POST` | `/api/sources/scan` | Trigger an immediate NDI rescan |
+
+### Timeline / DVR
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/timeline/?source_id={id}&start={iso}&end={iso}` | Every chunk + marker overlapping a window for one source. Max window: 7 days. |
+| `GET` | `/api/recordings/{id}/stream` | Range-aware MP4 passthrough for `<video>` playback (206 on `Range:` requests). |
+| `GET` | `/api/markers/?source_id={id}` | List markers (optionally filtered by `start`/`end`) |
+| `POST` | `/api/markers/` | Create a marker `{source_id, timestamp_utc, label?, color?}` |
+| `DELETE` | `/api/markers/{id}` | Remove a marker |
+| `POST` | `/api/clips/` | Queue a clip export `{source_id, start_utc, end_utc, label?}` (max 6 h) |
+| `GET` | `/api/clips/` | List clip export jobs (queued / running / done / failed) |
+| `GET` | `/api/clips/{id}` | Status + progress |
+| `GET` | `/api/clips/{id}/download` | Download the finished MP4 |
+| `DELETE` | `/api/clips/{id}` | Delete a terminal clip export (not while running) |
 
 ### Recordings
 
@@ -562,10 +582,11 @@ curl http://localhost:5000/api/sources | python3 -m json.tool
 │   ├── extensions.py            # SQLAlchemy, SocketIO, APScheduler
 │   ├── logging_config.py        # Console + rotating file + optional syslog
 │   ├── quality_profiles.py      # Archive / full / compressed encoding profiles
-│   ├── api/                     # Sources, Recordings, System blueprints
-│   ├── models/                  # SQLAlchemy models (source, chunk, app_settings)
-│   ├── recorder/                # NDI capture, upload, scheduler, retention
-│   └── dashboard/               # Flask views + Jinja templates
+│   ├── api/                     # Sources, Recordings, System, Timeline, Markers, Clips blueprints
+│   ├── models/                  # SQLAlchemy models (source, chunk, setting, marker, clip)
+│   ├── recorder/                # NDI capture, upload, scheduler, retention, clip_exporter
+│   ├── static/                  # watch.js (DVR player)
+│   └── dashboard/               # Flask views + Jinja templates (incl. watch.html)
 ├── migrations/                  # Alembic migration files
 ├── deploy/
 │   └── ndi-recorder.service     # systemd unit (venv-based)

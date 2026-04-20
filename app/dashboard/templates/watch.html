@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+{% block title %}Watch — NDI Recorder{% endblock %}
+
+{% block head %}
+<style>
+  .watch-wrap { display: grid; grid-template-rows: auto 1fr auto; gap: 12px; height: calc(100vh - var(--nav-h) - 48px); }
+  .watch-top  { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .watch-top select, .watch-top input[type=datetime-local] {
+    background: var(--surface); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  }
+  .grid-videos { display: grid; gap: 8px; min-height: 0; }
+  .grid-videos.cols-1 { grid-template-columns: 1fr; }
+  .grid-videos.cols-2 { grid-template-columns: 1fr 1fr; }
+  .grid-videos.cols-3, .grid-videos.cols-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
+  .pane { position: relative; background: #000; border: 1px solid var(--border);
+          border-radius: var(--radius); overflow: hidden; min-height: 0; }
+  .pane.primary { outline: 2px solid var(--accent); }
+  .pane video { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+  .pane-label { position: absolute; top: 6px; left: 8px; background: rgba(0,0,0,.6);
+                color: #fff; font-size: 11px; padding: 2px 7px; border-radius: 3px;
+                font-family: 'JetBrains Mono', monospace; }
+  .pane-state { position: absolute; top: 6px; right: 8px; background: rgba(0,0,0,.6);
+                color: #fcd34d; font-size: 10px; padding: 2px 7px; border-radius: 3px;
+                font-family: 'JetBrains Mono', monospace; }
+  .pane.empty { display: flex; align-items: center; justify-content: center;
+                color: var(--muted); font-size: 12px; border-style: dashed; }
+
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+              padding: 10px 12px; background: var(--surface); border: 1px solid var(--border);
+              border-radius: var(--radius); }
+  .controls .btn { padding: 5px 10px; }
+  .controls .btn.active { background: var(--accent); color: #052e16; }
+  .controls .sep { width: 1px; background: var(--border); align-self: stretch; margin: 0 4px; }
+  .time-readout { font-family: 'JetBrains Mono', monospace; font-size: 13px;
+                  color: var(--text); min-width: 200px; text-align: right; }
+
+  .timeline-wrap { position: relative; user-select: none; }
+  .timeline { position: relative; height: 58px; background: var(--surface);
+              border: 1px solid var(--border); border-radius: 6px;
+              overflow: hidden; cursor: crosshair; }
+  .tl-chunk { position: absolute; top: 22px; height: 22px;
+              background: rgba(34,197,94,.35); border-left: 1px solid rgba(34,197,94,.6); }
+  .tl-chunk.compressed { background: rgba(59,130,246,.32); border-color: rgba(59,130,246,.6); }
+  .tl-chunk.live       { background: rgba(239,68,68,.35); border-color: rgba(239,68,68,.7); }
+  .tl-axis { position: absolute; top: 0; left: 0; right: 0; height: 18px;
+             font-size: 10px; color: var(--muted); font-family: 'JetBrains Mono', monospace; }
+  .tl-tick { position: absolute; top: 0; bottom: 40px; width: 1px; background: var(--border); }
+  .tl-tick span { position: absolute; top: 1px; left: 3px; white-space: nowrap; }
+  .tl-cursor { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); pointer-events: none; z-index: 5; }
+  .tl-sel { position: absolute; top: 18px; height: 28px;
+            background: rgba(245,158,11,.22); border-left: 2px solid var(--warning);
+            border-right: 2px solid var(--warning); pointer-events: none; z-index: 3; }
+  .tl-marker { position: absolute; top: 18px; width: 10px; height: 40px;
+               transform: translateX(-5px); z-index: 4; cursor: pointer; }
+  .tl-marker::before { content: ""; position: absolute; top: 0; left: 50%;
+                       transform: translateX(-50%) rotate(45deg);
+                       width: 8px; height: 8px; background: currentColor; }
+  .tl-marker::after  { content: ""; position: absolute; top: 5px; left: 50%;
+                       transform: translateX(-50%); width: 2px; height: 35px; background: currentColor; }
+
+  .clip-list { display: flex; flex-direction: column; gap: 6px; max-height: 180px;
+               overflow: auto; padding: 8px; background: var(--surface);
+               border: 1px solid var(--border); border-radius: 6px; }
+  .clip-row  { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+  .clip-row .mono { color: var(--muted); }
+  .clip-row .progress { flex: 1; height: 5px; background: var(--border); border-radius: 3px; overflow: hidden; }
+  .clip-row .progress > div { height: 100%; background: var(--accent); transition: width .2s; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-header" style="margin-bottom:10px">
+  <h1 style="display:inline-block">Watch</h1>
+  <span class="text-muted text-sm" style="margin-left:10px">
+    Scrub, play back at speed, mark points, export clips. Recording keeps running the whole time.
+  </span>
+</div>
+
+<div class="watch-wrap">
+
+  <!-- ── Source + time + layout picker ─────────────────────────────────────── -->
+  <div class="watch-top">
+    <div class="flex gap-4 items-center">
+      <label class="text-sm text-muted">Pane A</label>
+      <select data-pane-select="0"></select>
+    </div>
+    <div class="flex gap-4 items-center">
+      <label class="text-sm text-muted">B</label>
+      <select data-pane-select="1"><option value="">—</option></select>
+    </div>
+    <div class="flex gap-4 items-center">
+      <label class="text-sm text-muted">C</label>
+      <select data-pane-select="2"><option value="">—</option></select>
+    </div>
+    <div class="flex gap-4 items-center">
+      <label class="text-sm text-muted">D</label>
+      <select data-pane-select="3"><option value="">—</option></select>
+    </div>
+    <div class="flex gap-4 items-center" style="margin-left:auto">
+      <label class="text-sm text-muted">Go to</label>
+      <input id="goto-time" type="datetime-local" step="1">
+      <button class="btn btn-ghost btn-sm" id="btn-goto">Go</button>
+      <button class="btn btn-ghost btn-sm" id="btn-live">Live edge</button>
+    </div>
+  </div>
+
+  <!-- ── Video grid ───────────────────────────────────────────────────────── -->
+  <div id="video-grid" class="grid-videos cols-1">
+    <div class="pane primary" data-pane="0">
+      <video data-video="0" playsinline preload="auto"></video>
+      <div class="pane-label" data-label="0">—</div>
+      <div class="pane-state" data-state="0"></div>
+    </div>
+    <div class="pane empty" data-pane="1" hidden>
+      <video data-video="1" playsinline preload="auto" muted hidden></video>
+      <div class="pane-label" data-label="1" hidden>—</div>
+      <div class="pane-state" data-state="1" hidden></div>
+    </div>
+    <div class="pane empty" data-pane="2" hidden>
+      <video data-video="2" playsinline preload="auto" muted hidden></video>
+      <div class="pane-label" data-label="2" hidden>—</div>
+      <div class="pane-state" data-state="2" hidden></div>
+    </div>
+    <div class="pane empty" data-pane="3" hidden>
+      <video data-video="3" playsinline preload="auto" muted hidden></video>
+      <div class="pane-label" data-label="3" hidden>—</div>
+      <div class="pane-state" data-state="3" hidden></div>
+    </div>
+  </div>
+
+  <!-- ── Controls + timeline ──────────────────────────────────────────────── -->
+  <div>
+    <div class="controls" style="margin-bottom:8px">
+      <button class="btn btn-ghost btn-sm" id="btn-play">▶ Play</button>
+      <button class="btn btn-ghost btn-sm" id="btn-pause">⏸ Pause</button>
+      <div class="sep"></div>
+      <span class="text-muted text-sm">Speed</span>
+      <button class="btn btn-ghost btn-sm" data-rate="-10">« 10×</button>
+      <button class="btn btn-ghost btn-sm" data-rate="-5">« 5×</button>
+      <button class="btn btn-ghost btn-sm" data-rate="-2">« 2×</button>
+      <button class="btn btn-ghost btn-sm" data-rate="0.5">½×</button>
+      <button class="btn btn-ghost btn-sm active" data-rate="1">1×</button>
+      <button class="btn btn-ghost btn-sm" data-rate="2">2×</button>
+      <button class="btn btn-ghost btn-sm" data-rate="5">5×</button>
+      <button class="btn btn-ghost btn-sm" data-rate="10">10×</button>
+      <div class="sep"></div>
+      <button class="btn btn-ghost btn-sm" id="btn-mark">＋ Mark</button>
+      <button class="btn btn-ghost btn-sm" id="btn-set-in">⎇ In</button>
+      <button class="btn btn-ghost btn-sm" id="btn-set-out">⎊ Out</button>
+      <button class="btn btn-primary btn-sm" id="btn-export">⬇ Export clip</button>
+      <div class="sep"></div>
+      <span class="text-muted text-sm">Window</span>
+      <select id="window-size">
+        <option value="900">15 min</option>
+        <option value="3600" selected>1 hour</option>
+        <option value="10800">3 hours</option>
+        <option value="21600">6 hours</option>
+        <option value="86400">24 hours</option>
+      </select>
+      <div class="time-readout" id="time-readout" style="margin-left:auto">—</div>
+    </div>
+
+    <div class="timeline-wrap">
+      <div class="timeline" id="timeline">
+        <div class="tl-axis"    id="tl-axis"></div>
+        <div class="tl-chunks"  id="tl-chunks"></div>
+        <div class="tl-sel"     id="tl-sel" hidden></div>
+        <div class="tl-cursor"  id="tl-cursor" style="left:0"></div>
+      </div>
+      <div class="text-muted text-sm mono" id="tl-hint" style="margin-top:4px">
+        Click to seek · drag to select an export range · double-click to add a marker
+      </div>
+    </div>
+
+    <div style="margin-top:8px">
+      <div class="card-title">Clip exports</div>
+      <div class="clip-list" id="clip-list">
+        <div class="text-muted text-sm">No exports yet.</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Bootstrap data for JS -->
+<script id="watch-bootstrap" type="application/json">
+{
+  "sources":   [{% for s in sources %}{"id": {{ s.id }}, "label": {{ (s.label or s.ndi_name)|tojson }} }{% if not loop.last %},{% endif %}{% endfor %}],
+  "initialIds": {{ initial_ids|tojson }},
+  "initialT":   {{ initial_t|tojson }}
+}
+</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/watch.js"></script>
+{% endblock %}
